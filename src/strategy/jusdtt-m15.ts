@@ -4,12 +4,15 @@ import { OrderManager } from "../core/order-manager";
 import { MT5Connector } from "../core/mt5-connector";
 import { STRATEGY_CONFIG } from "../config/strategy";
 import { detectPOI } from "../detectors/poi-detector";
-import { detectFVG } from "../detectors/fvg-detector";
+import { detectFVG, FVG } from "../detectors/fvg-detector";
 import { detectSweeps } from "../detectors/sweep-detector";
 import { detectRejection } from "../detectors/rejection-detector";
 import { computeVolume } from "../core/position-sizing";
 import { canOpenTrade, logTrade } from "../core/trade-filter";
 import { info, warn } from "../utils/logger";
+import { priceToPip } from "../utils/pip";
+import { atr } from "../utils/math";
+import { Candle } from "../utils/types";
 
 const SYMBOLS = ["GBPUSDz", "EURUSDz", "XAUUSDz"];
 
@@ -22,10 +25,33 @@ export class Strategy {
     this.orderManager = new OrderManager(connector);
   }
 
+  private pickNearestValidFVG(fvgs: FVG[], currentPrice: number, symbol: string, maxDistancePips?: number): (FVG & { distancePips: number; mid: number }) | null {
+    if (!fvgs || fvgs.length === 0) return null;
+
+    const scored = fvgs.map(fvg => {
+      const mid = (fvg.low + fvg.high) / 2;
+      const distancePips = priceToPip(symbol, Math.abs(mid - currentPrice));
+      return { ...fvg, mid, distancePips };
+    });
+
+    let nearby = scored;
+    if (typeof maxDistancePips === "number") {
+      nearby = scored.filter(s => s.distancePips <= maxDistancePips);
+    }
+
+    if (!nearby || nearby.length === 0) {
+      scored.sort((a, b) => a.distancePips - b.distancePips);
+      return scored[0] ?? null;
+    }
+
+    nearby.sort((a, b) => a.distancePips - b.distancePips);
+    return nearby[0];
+  }
+
   async scanAndAct() {
     for (const symbol of SYMBOLS) {
       try {
-        const candles = await this.dataFeed.getRecentCandles(symbol, STRATEGY_CONFIG.timeframe, 500);
+        const candles: Candle[] = await this.dataFeed.getRecentCandles(symbol, STRATEGY_CONFIG.timeframe, 500);
         if (!candles || candles.length < 50) continue;
 
         const currentCandle = candles[candles.length - 1];
@@ -44,7 +70,9 @@ export class Strategy {
         const side = latestSweep.side;
         const bias = side === 'BUY' ? 'BULL' : 'BEAR';
 
-        if (!canOpenTrade(symbol, side)) {
+        // <-- IMPORTANT: await the async canOpenTrade
+        const allowed = await canOpenTrade(this.connector, symbol, side);
+        if (!allowed) {
           info(`trade blocked by filter for ${symbol} ${side}`);
           continue;
         }
@@ -66,62 +94,69 @@ export class Strategy {
           continue;
         }
 
-        const recentFVGs = fvgs.slice(-20);
-        const candidateFVG = recentFVGs.reverse().find(f => 
-          (bias === 'BULL' ? f.side === 'BULL' : f.side === 'BEAR')
-        );
-        
-        if (!candidateFVG) continue;
+        // --- NEW: dynamic distance cap based on ATR ---
+        const atrVal = atr(candles, 20) || pipSize * 100; // fallback
+        const atrPips = priceToPip(symbol, atrVal);
 
-        const nearbyRej = rejections.slice(-6).find(r => 
-          (bias === 'BULL' ? r.side === 'BUY' : r.side === 'SELL')
-        );
-        
-        if (!nearbyRej) continue;
+        // base minimums
+        const baseMin = symbol.includes('XAU') ? 80 : 50;
+        // scale multiplier (how many ATRs away is acceptable)
+        const scale = symbol.includes('XAU') ? 2.5 : 2.0;
+        const dynamicMaxDistance = Math.max(baseMin, Math.round(atrPips * scale));
 
+        // limit how many recent FVGs we look at
+        const recentFVGs = fvgs.slice(-40);
+        const sameBiasFVGs = recentFVGs.filter(f => (bias === 'BULL' ? f.side === 'BULL' : f.side === 'BEAR'));
+
+        // pick nearest valid FVG using dynamic cap
+        const candidate = this.pickNearestValidFVG(sameBiasFVGs, currentPrice, symbol, dynamicMaxDistance);
+        if (!candidate) {
+          info(`No nearby FVG within ${dynamicMaxDistance} pips for ${symbol}. Skipping.`);
+          continue;
+        }
+
+        const candidateFVG = { high: candidate.high, low: candidate.low, index: candidate.index };
         const fvgHigh = candidateFVG.high;
         const fvgLow = candidateFVG.low;
-        const fvgMid = (fvgHigh + fvgLow) / 2;
-        
-        const distanceToFVG = Math.abs(currentPrice - fvgMid) / pipSize;
-        const proximityThreshold = 30;
+        const fvgMid = candidate.mid;
+
+        const distanceToFVG = candidate.distancePips;
+        const insideTolerancePips = 3;
+        const insideTolerancePrice = insideTolerancePips * pipSize;
 
         let entry: number;
         let useMarketOrder = false;
 
-        if (distanceToFVG <= proximityThreshold) {
-          info(`✅ Price INSIDE FVG (${distanceToFVG.toFixed(1)} pips away). Using MARKET order.`);
+        if (currentPrice >= fvgLow - insideTolerancePrice && currentPrice <= fvgHigh + insideTolerancePrice) {
+          info(`✅ Price INSIDE or very near FVG (${distanceToFVG.toFixed(1)} pips). Using MARKET order.`);
           entry = currentPrice;
           useMarketOrder = true;
         } else {
           if (bias === 'BULL') {
             entry = fvgLow;
-            
             if (entry >= currentPrice) {
               warn(`BUY limit invalid: entry ${entry} >= current ${currentPrice}. Skipping.`);
               continue;
             }
           } else {
             entry = fvgHigh;
-            
             if (entry <= currentPrice) {
               warn(`SELL limit invalid: entry ${entry} <= current ${currentPrice}. Skipping.`);
               continue;
             }
           }
 
-          const distanceToEntry = Math.abs(entry - currentPrice) / pipSize;
-          
-          if (distanceToEntry > 100) {
-            info(`🕐 FVG too far (${distanceToEntry.toFixed(1)} pips). Waiting for price to approach...`);
+          const distanceToEntry = priceToPip(symbol, Math.abs(entry - currentPrice));
+
+          if (distanceToEntry > dynamicMaxDistance) {
+            info(`🕐 Nearest FVG too far (${distanceToEntry.toFixed(1)} pips, limit ${dynamicMaxDistance}). Waiting.`);
             continue;
           }
 
-          info(`📍 Price approaching FVG (${distanceToEntry.toFixed(1)} pips away). Placing LIMIT order.`);
+          info(`📍 Nearest FVG ${distanceToEntry.toFixed(1)} pips away. Placing LIMIT order.`);
         }
 
         const slPips = STRATEGY_CONFIG.sl.pipsBelowSweep;
-        
         const slPrice = side === 'BUY' 
           ? entry - slPips * pipSize
           : entry + slPips * pipSize;
@@ -130,15 +165,17 @@ export class Strategy {
           ? entry + (STRATEGY_CONFIG.tp.minRR * Math.abs(entry - slPrice))
           : entry - (STRATEGY_CONFIG.tp.minRR * Math.abs(slPrice - entry));
 
-        const slDistance = Math.abs(entry - slPrice) / pipSize;
-        const tpDistance = Math.abs(entry - tpPrice) / pipSize;
+        const slDistance = priceToPip(symbol, Math.abs(entry - slPrice));
+        const tpDistance = priceToPip(symbol, Math.abs(entry - tpPrice));
 
         if (slDistance < 5) {
           warn(`SL too close: ${slDistance.toFixed(1)} pips`);
           continue;
         }
 
-        const accountBalance = 1000;
+        // auto-compounding: use real account balance
+        const accountInfo = await this.connector.getAccountInfo();
+        const accountBalance = accountInfo?.balance ?? 1000;
         const lots = computeVolume(accountBalance, STRATEGY_CONFIG.risk.riskPercent, slPips, symbol);
 
         info('📊 Placing order', { 
@@ -151,7 +188,9 @@ export class Strategy {
           tp: tpPrice.toFixed(symbol.includes('XAU') ? 2 : 5),
           lots,
           slPips: slDistance.toFixed(1),
-          tpPips: tpDistance.toFixed(1)
+          tpPips: tpDistance.toFixed(1),
+          fvgDistancePips: distanceToFVG.toFixed(1),
+          dynamicMaxDistance
         });
 
         if (useMarketOrder) {

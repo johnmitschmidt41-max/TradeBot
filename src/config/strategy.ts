@@ -25,10 +25,13 @@ export const STRATEGY_CONFIG = {
     bodyPercent: 0.3
   },
 
-  risk: {
-    riskPercent: 0.02,
-    maxTradesPerDay: 5
-  },
+ risk: {
+  riskPercent: 2,
+  dailyDrawdownPercent: 5,
+  maxSimultaneousTrades: 3,
+  directionCooldownSeconds: 300,
+  maxTradesPerDay: 5
+},
 
   sl: {
     pipsBelowSweep: 20

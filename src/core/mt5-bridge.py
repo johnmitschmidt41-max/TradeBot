@@ -177,6 +177,16 @@ def get_orders():
         print(f"❌ Error fetching orders for {symbol}: {e}")
         return jsonify({"orders": []}), 500
 
+@app.route('/account', methods=['GET'])
+def account():
+    if not mt5_initialized:
+        return jsonify({"account": None}), 200
+    
+    info = mt5.account_info()
+    return jsonify({"account": info._asdict()})
+
+
+
 @app.route('/order', methods=['POST'])
 def order():
     if not mt5_initialized:

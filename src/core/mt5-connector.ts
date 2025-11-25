@@ -12,6 +12,15 @@ export interface Candle {
   volume: number;
 }
 
+export interface AccountInfo {
+  login?: number;
+  balance?: number;
+  equity?: number;
+  margin?: number;
+  free_margin?: number;
+  [key: string]: any;
+}
+
 export class MT5Connector {
   private isConnected = false;
 
@@ -43,7 +52,7 @@ export class MT5Connector {
     symbol: string;
     type: 'BUY' | 'SELL';
     volume: number;
-    price: number;
+    price?: number;
     sl: number;
     tp: number;
   }): Promise<any> {
@@ -51,9 +60,10 @@ export class MT5Connector {
     return response.data;
   }
 
+  // Backwards-compatible: returns all positions or positions for symbol
   async getPositions(): Promise<any[]> {
     const response = await axios.get(`${MT5_BRIDGE_URL}/positions`);
-    return response.data.positions;
+    return response.data.positions || [];
   }
 
   async getOpenPositions(symbol?: string): Promise<any[]> {
@@ -72,5 +82,16 @@ export class MT5Connector {
     
     const response = await axios.get(url);
     return response.data.orders || [];
+  }
+
+  // NEW: account info (balance, equity, etc.)
+  async getAccountInfo(): Promise<AccountInfo | null> {
+    const response = await axios.get(`${MT5_BRIDGE_URL}/account`);
+    return response.data.account ?? null;
+  }
+
+  // NEW: convenience wrapper for all open positions (alias)
+  async getAllOpenPositions(): Promise<any[]> {
+    return this.getOpenPositions();
   }
 }
