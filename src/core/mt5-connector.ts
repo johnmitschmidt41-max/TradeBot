@@ -90,6 +90,13 @@ export class MT5Connector {
     return response.data.account ?? null;
   }
 
+  // Fetch closed deal history (optionally since epoch seconds)
+  async getDeals(since?: number): Promise<any[]> {
+    const url = typeof since === 'number' ? `${MT5_BRIDGE_URL}/deals?since=${since}` : `${MT5_BRIDGE_URL}/deals`;
+    const response = await axios.get(url);
+    return response.data.deals || [];
+  }
+
   // NEW: convenience wrapper for all open positions (alias)
   async getAllOpenPositions(): Promise<any[]> {
     return this.getOpenPositions();

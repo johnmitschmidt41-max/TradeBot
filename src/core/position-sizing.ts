@@ -1,18 +1,11 @@
-// Accurate EXNESS Position Sizing (No MetaSymbolInfo needed)
-
-const CONTRACT_SIZES: Record<string, number> = {
-    "XAUUSD": 100,   // 1 lot = 100 gold ounces
-    "XAGUSD": 5000,  // 1 lot = 5000 silver ounces
-    "US30": 1,
-    "NAS100": 1,
-    "SPX500": 1,
-};
-
-// Default FX contract size
-const DEFAULT_FX_CONTRACT_SIZE = 100000;
-
 /**
- * Calculates lot size based on balance, risk %, and stop loss size.
+ * Correct Exness position sizing for FX, Gold, Indices
+ * 
+ * @param balance Account balance in USD
+ * @param riskPercent Risk percentage (e.g., 10 for 10%), NOT decimal (0.10)
+ * @param stopLossPips Stop loss in pips
+ * @param symbol Trading symbol
+ * @returns Volume in lots
  */
 export function computeVolume(
     balance: number,
@@ -21,32 +14,81 @@ export function computeVolume(
     symbol: string
 ): number {
 
-    if (!stopLossPips || stopLossPips <= 0) return 0.01;
+    // Convert percentage to decimal (10 → 0.10)
+    const riskUSD = balance * (riskPercent / 100);
+    if (riskUSD <= 0 || stopLossPips <= 0) return 0.01;
 
-    // 1️⃣ TOTAL MONEY WE ARE WILLING TO RISK
-    const riskUSD = balance * riskPercent;
-    if (riskUSD <= 0) return 0.01;
+    const s = symbol.replace("z", "").toUpperCase();
 
-    // 2️⃣ CLEAN SYMBOL FORMAT
-    const clean = symbol.replace(".", "").replace("z", "").toUpperCase();
+    // 1️⃣ Contract sizes (verified with Exness)
+    const contractSize =
+        s === "XAUUSD" ? 100 :
+        s === "XAGUSD" ? 5000 :
+        s.includes("USD") || s.includes("JPY") ? 100000 :
+        100000;
 
-    // 3️⃣ EXNESS CONTRACT SIZE
-    const contractSize = CONTRACT_SIZES[clean] || DEFAULT_FX_CONTRACT_SIZE;
+    // 2️⃣ Pip size definition
+    const pipSize =
+        s.includes("JPY") ? 0.01 :
+        s === "XAUUSD" ? 0.01 :
+        s === "XAGUSD" ? 0.01 :
+        0.0001;
 
-    // 4️⃣ DIGITS → USED TO CALCULATE PIP SIZE
-    const pipSize = clean.includes("JPY") ? 0.001 : 0.0001;
-
-    // 5️⃣ PIP VALUE PER 1 LOT
-    // Example: XAU (100 * 0.01 = $1 per pip)
+    // 3️⃣ Pip value per lot (USD earned/lost per pip per 1 lot)
     const pipValuePerLot = contractSize * pipSize;
 
-    // 6️⃣ RISK PER LOT = SL * pipValue
-    const riskPerLot = stopLossPips * pipValuePerLot;
-    if (riskPerLot <= 0) return 0.01;
+    // 4️⃣ Risk per 1 lot
+    const riskPerLotUSD = stopLossPips * pipValuePerLot;
 
-    // 7️⃣ FINAL LOT SIZE
-    const lots = +(riskUSD / riskPerLot).toFixed(2);
+    if (riskPerLotUSD <= 0) return 0.01;
 
-    // 8️⃣ SAFETY LIMIT
-    return Math.min(Math.max(lots, 0.01), 50);
+    // 5️⃣ Proper lot size
+    const rawLots = riskUSD / riskPerLotUSD;
+
+    // 6️⃣ Clamp to safe min/max
+    const lots = Math.min(Math.max(+rawLots.toFixed(2), 0.01), 10);
+
+    return lots;
+}
+
+/**
+ * Returns USD value per pip for 1 lot of the given symbol (used for risk calculations)
+ */
+export function pipValuePerLot(symbol: string): number {
+    const s = symbol.replace("z", "").toUpperCase();
+
+    const contractSize =
+        s === "XAUUSD" ? 100 :
+        s === "XAGUSD" ? 5000 :
+        s.includes("USD") || s.includes("JPY") ? 100000 :
+        100000;
+
+    const pipSize =
+        s.includes("JPY") ? 0.01 :
+        s === "XAUUSD" ? 0.01 :
+        s === "XAGUSD" ? 0.01 :
+        0.0001;
+
+    return contractSize * pipSize;
+}
+
+/**
+ * Returns helpful metadata for a trading symbol: contractSize and pipSize
+ */
+export function getSymbolMeta(symbol: string): { contractSize: number; pipSize: number } {
+    const s = symbol.replace("z", "").toUpperCase();
+
+    const contractSize =
+        s === "XAUUSD" ? 100 :
+        s === "XAGUSD" ? 5000 :
+        s.includes("USD") || s.includes("JPY") ? 100000 :
+        100000;
+
+    const pipSize =
+        s.includes("JPY") ? 0.01 :
+        s === "XAUUSD" ? 0.01 :
+        s === "XAGUSD" ? 0.01 :
+        0.0001;
+
+    return { contractSize, pipSize };
 }

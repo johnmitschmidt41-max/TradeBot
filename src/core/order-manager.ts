@@ -20,7 +20,10 @@ export class OrderManager {
       info('Order result', res);
       return res;
     } catch (err: any) {
-      error('Order error', err?.response?.data ?? err?.message ?? err);
+      // use format helper for robust error messages
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const { formatError } = require('../utils/error');
+      error('Order error', err?.response?.data ?? formatError(err));
       throw err;
     }
   }
@@ -45,7 +48,9 @@ export class OrderManager {
       info('Order result', res);
       return res;
     } catch (err: any) {
-      error('Order error', err?.response?.data ?? err?.message ?? err);
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const { formatError } = require('../utils/error');
+      error('Order error', err?.response?.data ?? formatError(err));
       throw err;
     }
   }

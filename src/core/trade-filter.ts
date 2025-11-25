@@ -2,6 +2,7 @@
 import { STRATEGY_CONFIG } from "../config/strategy";
 import { nowSec } from "../utils/time";
 import { info, warn } from "../utils/logger";
+import { persistTradeSignal } from "./trade-storage";
 import { MT5Connector } from "../core/mt5-connector";
 
 type TradeLog = { symbol: string; time: number; side: 'BUY' | 'SELL' };
@@ -55,7 +56,9 @@ export async function canOpenTrade(connector: MT5Connector, symbol: string, side
       return false;
     }
   } catch (err: any) {
-    warn('Could not fetch open positions for max-sim check:', err?.message ?? err);
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { formatError } = require('../utils/error');
+    warn('Could not fetch open positions for max-sim check:', formatError(err));
     // if we can't fetch positions, be conservative and allow trading (or you can choose to block)
   }
 
@@ -85,7 +88,9 @@ export async function canOpenTrade(connector: MT5Connector, symbol: string, side
       return false;
     }
   } catch (err: any) {
-    warn('Error computing daily drawdown:', err?.message ?? err);
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { formatError } = require('../utils/error');
+    warn('Error computing daily drawdown:', formatError(err));
     // if error fetching account, allow (or block); we choose to allow but log
   }
 
@@ -94,4 +99,20 @@ export async function canOpenTrade(connector: MT5Connector, symbol: string, side
 
 export function logTrade(symbol: string, side: 'BUY' | 'SELL') {
   tradesLog.push({ symbol, side, time: nowSec() });
+  try {
+    // persist a minimal signal record for later analysis
+    persistTradeSignal({
+      time: nowSec(),
+      symbol,
+      side,
+      orderType: 'SIGNAL' as any,
+      entry: 0,
+      sl: 0,
+      tp: 0,
+      lots: 0,
+      status: 'signal'
+    });
+  } catch (e) {
+    // non-fatal
+  }
 }

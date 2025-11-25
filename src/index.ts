@@ -1,4 +1,6 @@
 // src/index.ts
+// load .env early so GEMINI_API_KEY / GEMINI_API_URL can be read
+import 'dotenv/config';
 import { MT5Connector } from "./core/mt5-connector";
 import { Strategy } from "./strategy/jusdtt-m15";
 import { info, error } from "./utils/logger";

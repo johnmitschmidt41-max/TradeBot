@@ -2,6 +2,7 @@ print("script started")
 
 import MetaTrader5 as mt5
 from flask import Flask, request, jsonify
+from datetime import datetime
 from flask_cors import CORS
 import sys
 import time
@@ -243,6 +244,45 @@ def order():
         "order": result.order,
         "deal": result.deal
     })
+
+
+@app.route('/deals', methods=['GET'])
+def get_deals():
+    """Fetch history deals. Optional query parameter `since` as epoch seconds to fetch long-running history since that time."""
+    if not mt5_initialized:
+        return jsonify({"deals": []})
+
+    since = request.args.get('since', default=None, type=int)
+    try:
+        if since:
+            from_time = datetime.fromtimestamp(since)
+        else:
+            # default to fetching all history
+            from_time = datetime(1970, 1, 1)
+
+        to_time = datetime.now()
+        deals = mt5.history_deals_get(from_time, to_time)
+
+        if deals is None:
+            return jsonify({"deals": []})
+
+        deal_list = []
+        for d in deals:
+            deal_list.append({
+                "deal": getattr(d, 'deal', None),
+                "order": getattr(d, 'order', None),
+                "symbol": getattr(d, 'symbol', None),
+                "time": int(getattr(d, 'time', 0)),
+                "price": float(getattr(d, 'price', 0.0)),
+                "volume": float(getattr(d, 'volume', 0.0)),
+                "profit": float(getattr(d, 'profit', 0.0)),
+                "type": getattr(d, 'type', None)
+            })
+
+        return jsonify({"deals": deal_list})
+    except Exception as e:
+        print('❌ Error fetching deals:', e)
+        return jsonify({"deals": []}), 500
 
 
 if __name__ == "__main__":
