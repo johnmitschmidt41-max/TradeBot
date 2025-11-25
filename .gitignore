@@ -1,0 +1,86 @@
+# ─────────────────────────────
+# Node / TypeScript
+# ─────────────────────────────
+
+node_modules/
+dist/
+build/
+tmp/
+temp/
+
+# TypeScript cache
+*.tsbuildinfo
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# Editor junk
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# ─────────────────────────────
+# Python (MT5 bridge)
+# ─────────────────────────────
+
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+ENV/
+env/
+
+# Flask cache
+instance/
+*.pid
+
+# MT5 terminal temporary files
+*.dat
+*.ini
+*.log
+MQL5/Logs/
+MQL5/Profiles/
+MQL5/Caches/
+
+# Ignore compiled EX5 files
+MQL5/Experts/*.ex5
+MQL5/Indicators/*.ex5
+
+# ─────────────────────────────
+# Project-specific
+# ─────────────────────────────
+
+# Output from strategies
+backtests/
+cache/
+data/
+
+# Generated JSON or session files
+*.session.json
+*.cache.json
+
+# MT5 bridge files
+mt5-bridge/__pycache__/
+mt5-bridge/logs/
+
+# Local certificates (if any)
+*.pem
+*.crt
+*.key
+
