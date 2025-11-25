@@ -2,7 +2,7 @@
 import { DataFeed } from "../core/data-feed";
 import { OrderManager } from "../core/order-manager";
 import { MT5Connector } from "../core/mt5-connector";
-import { STRATEGY_CONFIG } from "../config/strategy";
+import { STRATEGY_CONFIG, getSLPips } from "../config/strategy";
 import { detectPOI } from "../detectors/poi-detector";
 import { detectFVG, FVG } from "../detectors/fvg-detector";
 import { detectSweeps } from "../detectors/sweep-detector";
@@ -70,7 +70,6 @@ export class Strategy {
         const side = latestSweep.side;
         const bias = side === 'BUY' ? 'BULL' : 'BEAR';
 
-        // <-- IMPORTANT: await the async canOpenTrade
         const allowed = await canOpenTrade(this.connector, symbol, side);
         if (!allowed) {
           info(`trade blocked by filter for ${symbol} ${side}`);
@@ -94,21 +93,17 @@ export class Strategy {
           continue;
         }
 
-        // --- NEW: dynamic distance cap based on ATR ---
-        const atrVal = atr(candles, 20) || pipSize * 100; // fallback
+        // --- ATR-based dynamic distance cap ---
+        const atrVal = atr(candles, 20) || pipSize * 100;
         const atrPips = priceToPip(symbol, atrVal);
 
-        // base minimums
         const baseMin = symbol.includes('XAU') ? 80 : 50;
-        // scale multiplier (how many ATRs away is acceptable)
         const scale = symbol.includes('XAU') ? 2.5 : 2.0;
         const dynamicMaxDistance = Math.max(baseMin, Math.round(atrPips * scale));
 
-        // limit how many recent FVGs we look at
         const recentFVGs = fvgs.slice(-40);
         const sameBiasFVGs = recentFVGs.filter(f => (bias === 'BULL' ? f.side === 'BULL' : f.side === 'BEAR'));
 
-        // pick nearest valid FVG using dynamic cap
         const candidate = this.pickNearestValidFVG(sameBiasFVGs, currentPrice, symbol, dynamicMaxDistance);
         if (!candidate) {
           info(`No nearby FVG within ${dynamicMaxDistance} pips for ${symbol}. Skipping.`);
@@ -156,7 +151,9 @@ export class Strategy {
           info(`📍 Nearest FVG ${distanceToEntry.toFixed(1)} pips away. Placing LIMIT order.`);
         }
 
-        const slPips = STRATEGY_CONFIG.sl.pipsBelowSweep;
+        // ✅ FIX: Use symbol-specific SL distance
+        const slPips = getSLPips(symbol);
+        
         const slPrice = side === 'BUY' 
           ? entry - slPips * pipSize
           : entry + slPips * pipSize;
@@ -173,9 +170,11 @@ export class Strategy {
           continue;
         }
 
-        // auto-compounding: use real account balance
+        // ✅ FIX: Use real account balance for position sizing
         const accountInfo = await this.connector.getAccountInfo();
-        const accountBalance = accountInfo?.balance ?? 1000;
+        const accountBalance = accountInfo?.balance ?? 100;
+        
+        // ✅ FIX: Pass symbol to computeVolume for accurate pip value calculation
         const lots = computeVolume(accountBalance, STRATEGY_CONFIG.risk.riskPercent, slPips, symbol);
 
         info('📊 Placing order', { 
@@ -190,7 +189,9 @@ export class Strategy {
           slPips: slDistance.toFixed(1),
           tpPips: tpDistance.toFixed(1),
           fvgDistancePips: distanceToFVG.toFixed(1),
-          dynamicMaxDistance
+          dynamicMaxDistance,
+          accountBalance: accountBalance.toFixed(2),
+          riskAmount: (accountBalance * STRATEGY_CONFIG.risk.riskPercent / 100).toFixed(2)
         });
 
         if (useMarketOrder) {
