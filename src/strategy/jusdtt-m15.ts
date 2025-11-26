@@ -20,19 +20,14 @@ import path from 'path';
 
 const SYMBOLS = ["GBPUSDz", "EURUSDz", "XAUUSDz", "USDJPYz"];
 
-// Map user-friendly gating modes to numeric maximum allowed loss probability.
 function mlModeToThreshold(mode?: string | null): number | null {
   if (!mode) return null;
   const m = (mode || '').toString().toLowerCase();
   switch (m) {
-    case 'strict':
-      return 0.50; // higher volume: allow when lossProb <= 0.50 (35-40% win)
-    case 'medium':
-      return 0.60; // 10-15 trades/day: allow when lossProb <= 0.60 (30% win)
-    case 'loose':
-      return 0.70; // very high volume: allow when lossProb <= 0.70 (25% win)
-    default:
-      return null;
+    case 'strict': return 0.50;
+    case 'medium': return 0.60;
+    case 'loose': return 0.70;
+    default: return null;
   }
 }
 
@@ -69,10 +64,7 @@ export class Strategy {
     return nearby[0];
   }
 
-  // Lightweight high-frequency (M5) pass — tries to capture fast opportunities
-  // with HTF confirmation and stricter ML gating + lot-scaling.
   private async attemptHighFreq(symbol: string, timeframe: string) {
-    // quick fetch
     const candles: Candle[] = await this.dataFeed.getRecentCandles(symbol, timeframe, 300);
     if (!candles || candles.length < 50) return;
 
@@ -82,7 +74,6 @@ export class Strategy {
     const latest = recentSweeps[recentSweeps.length - 1];
     const side = latest.side;
 
-    // per-symbol daily cap (best-effort in-memory check)
     const perCap = (STRATEGY_CONFIG.highFrequency?.perSymbolDailyCap && (STRATEGY_CONFIG.highFrequency?.perSymbolDailyCap as any)[symbol]) ?? STRATEGY_CONFIG.highFrequency?.perSymbolDailyCap?.default ?? 30;
     const todayCount = getTradesTodayCount(symbol);
     if (todayCount >= perCap) {
@@ -90,22 +81,17 @@ export class Strategy {
       return;
     }
 
-    // HTF confirmation
     const htf = STRATEGY_CONFIG.highFrequency?.htfConfirm ?? 'M15';
     try {
       const htfCandles = await this.dataFeed.getRecentCandles(symbol, htf, 200);
       if (htfCandles && htfCandles.length > 20 && STRATEGY_CONFIG.filters?.trendEnabled) {
         const maShort = sma(htfCandles, STRATEGY_CONFIG.filters?.maShort || 50);
         const maLong = sma(htfCandles, STRATEGY_CONFIG.filters?.maLong || 200);
-        if (maShort === 0 || maLong === 0) {
-          // not enough HTF history — bail
-          return;
-        }
+        if (maShort === 0 || maLong === 0) return;
         if (side === 'BUY' && maShort <= maLong) return;
         if (side === 'SELL' && maShort >= maLong) return;
       }
     } catch (e:any) {
-      // HTF fetch failed — don't proceed with high freq attempt
       warn('M5 HTF fetch failed', e?.message ?? e);
       return;
     }
@@ -114,7 +100,6 @@ export class Strategy {
 
     if (!await canOpenTrade(this.connector, symbol, side)) return;
 
-    // select FVG candidate
     const fvgs = detectFVG(candles, STRATEGY_CONFIG.fvg.minGapPips, symbol);
     const atrVal = atr(candles, 20) || (symbol.includes('XAU') || symbol.includes('JPY') ? 0.01 : 0.0001) * 100;
     const dynamicMaxDistance = Math.max(symbol.includes('XAU') ? 80 : 50, Math.round(priceToPip(symbol, atrVal) * (symbol.includes('XAU') ? 2.5 : 2.0)));
@@ -123,7 +108,6 @@ export class Strategy {
 
     const entry = (currentPrice >= candidate.low && currentPrice <= candidate.high) ? currentPrice : (side === 'BUY' ? candidate.low : candidate.high);
 
-    // compute sl/tp and lots
     const pipSize = (symbol.includes('XAU') || symbol.includes('JPY')) ? 0.01 : 0.0001;
     const slBuffer = symbol.includes('XAU') ? 200 : 10;
     const sl = side === 'BUY' ? entry - (slBuffer * pipSize) : entry + (slBuffer * pipSize);
@@ -137,24 +121,18 @@ export class Strategy {
     lots = Math.round((lots * (STRATEGY_CONFIG.risk?.scalingFactor ?? 1) * (STRATEGY_CONFIG.highFrequency?.m5ScalingFactor ?? 0.3)) * 100) / 100;
     if (lots < 0.01) return;
 
-    // quick model scoring with stricter threshold
     if (ML_CONFIG?.enabled) {
       try {
         const score = await scoreWithRemoteModel({ symbol, side, entry, sl, tp, lots, accountBalance, slPips: slDistance });
-        // Respect explicit HF override (mlMaxLossProb); otherwise derive threshold from
-        // global gating mode (strict/medium/loose) or fall back to declineLossProb.
         const modeThr = mlModeToThreshold(ML_CONFIG?.gatingMode);
         const thr = STRATEGY_CONFIG.highFrequency?.mlMaxLossProb ?? modeThr ?? ML_CONFIG.declineLossProb ?? 0.6;
-        // allow trade when lossProb <= thr (skip when lossProb > thr)
         if (!score || typeof score.lossProb !== 'number' || score.lossProb > thr) return;
       } catch (e:any) {
-        // scoring failed -> skip M5 attempt
         warn('M5 scoring failed', e?.message ?? e);
         return;
       }
     }
 
-    // persist quick signal with CID and place an order
     let cid: string | null = null;
     try {
       cid = persistTradeSignalWithCid({ time: Math.floor(Date.now()/1000), symbol, side, orderType: 'MARKET', entry: +entry, price: +entry, sl: +sl, tp: +tp, lots, status: 'placed' });
@@ -225,7 +203,34 @@ export class Strategy {
           continue;
         }
         
-        const latestSweep = recentSweeps[recentSweeps.length - 1];
+        // --- Trend and Liquidity Filters ---
+        const filters = STRATEGY_CONFIG.filters ?? {} as any;
+        
+        // Determine preferred side based on trend (uptrend=BUY, downtrend=SELL)
+        let preferredSide: 'BUY' | 'SELL' | null = null;
+        if (filters.trendEnabled) {
+          const maShort = sma(candles, filters.maShort || 50);
+          const maLong = sma(candles, filters.maLong || 200);
+          if (maShort > maLong) {
+            preferredSide = 'BUY';  // Uptrend: prefer BUYs
+          } else if (maShort < maLong) {
+            preferredSide = 'SELL'; // Downtrend: prefer SELLs
+          }
+        }
+
+        // Find sweep matching preferred side, or fall back to latest sweep
+        let latestSweep = recentSweeps[recentSweeps.length - 1];
+        if (preferredSide) {
+          const matchingSweep = recentSweeps.reverse().find(s => s.side === preferredSide);
+          if (matchingSweep) {
+            latestSweep = matchingSweep;
+            info(`Trend-aligned: using ${preferredSide} sweep for ${symbol}`);
+          } else {
+            // Fall back if no matching sweep
+            info(`No ${preferredSide} sweep available, using latest sweep (${latestSweep.side})`);
+          }
+        }
+        
         const side = latestSweep.side;
         const bias = side === 'BUY' ? 'BULL' : 'BEAR';
 
@@ -233,26 +238,6 @@ export class Strategy {
         if (!allowed) {
           info(`trade blocked by filter for ${symbol} ${side}`);
           continue;
-        }
-
-        // --- Trend and Liquidity Filters ---
-        const filters = STRATEGY_CONFIG.filters ?? {} as any;
-        if (filters.trendEnabled) {
-          const maShort = sma(candles, filters.maShort || 50);
-          const maLong = sma(candles, filters.maLong || 200);
-
-          if (maShort === 0 || maLong === 0) {
-            info('Not enough history for MA trend filter, skipping trend check.');
-          } else {
-            if (side === 'BUY' && maShort <= maLong) {
-              info(`Against trend (MA${filters.maShort} <= MA${filters.maLong}) — skipping ${symbol} ${side}`);
-              continue;
-            }
-            if (side === 'SELL' && maShort >= maLong) {
-              info(`Against trend (MA${filters.maShort} >= MA${filters.maLong}) — skipping ${symbol} ${side}`);
-              continue;
-            }
-          }
         }
 
         if (filters.liquidityEnabled) {
