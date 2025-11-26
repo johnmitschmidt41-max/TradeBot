@@ -22,4 +22,6 @@ export type OrderRequest = {
   price: number;
   sl?: number;
   tp?: number;
+  // free-form comment that will be attached to the broker order (optional)
+  comment?: string;
 };

@@ -2,7 +2,7 @@ print("script started")
 
 import MetaTrader5 as mt5
 from flask import Flask, request, jsonify
-from datetime import datetime
+from datetime import datetime, timedelta
 from flask_cors import CORS
 import sys
 import time
@@ -169,7 +169,8 @@ def get_orders():
                 "volume": order.volume_initial,  # ← FIXED
                 "price_open": order.price_open,
                 "sl": order.sl,
-                "tp": order.tp
+                "tp": order.tp,
+                "comment": getattr(order, 'comment', None)
             })
         
         return jsonify({"orders": order_list})
@@ -222,7 +223,8 @@ def order():
         "sl": sl,
         "tp": tp,
         "magic": 889900,
-        "comment": "mainbot",
+        # allow caller to inject a comment (we use this for client-side CID matching)
+        "comment": data.get('comment', 'mainbot'),
         "type_time": mt5.ORDER_TIME_GTC,
         "type_filling": mt5.ORDER_FILLING_IOC,
     }
@@ -257,11 +259,26 @@ def get_deals():
         if since:
             from_time = datetime.fromtimestamp(since)
         else:
-            # default to fetching all history
-            from_time = datetime(1970, 1, 1)
+            # default to a recent window to avoid requesting the entire history
+            # (fetch last 30 days). Asking for everything (from epoch) can crash
+            # the native MT5 API in some environments / versions.
+            from_time = datetime.now() - timedelta(days=30)
 
         to_time = datetime.now()
-        deals = mt5.history_deals_get(from_time, to_time)
+        try:
+            deals = mt5.history_deals_get(from_time, to_time)
+        except Exception as e:
+            # history_deals_get sometimes raises low-level exceptions in the
+            # MetaTrader5 native binding (e.g. if the time range is too large).
+            # Log the error from mt5 and return an empty list to callers.
+            mt5_err = None
+            try:
+                mt5_err = mt5.last_error()
+            except Exception:
+                mt5_err = None
+
+            print('❌ history_deals_get exception:', e, 'mt5.last_error():', mt5_err)
+            return jsonify({"deals": []}), 500
 
         if deals is None:
             return jsonify({"deals": []})
@@ -276,7 +293,9 @@ def get_deals():
                 "price": float(getattr(d, 'price', 0.0)),
                 "volume": float(getattr(d, 'volume', 0.0)),
                 "profit": float(getattr(d, 'profit', 0.0)),
-                "type": getattr(d, 'type', None)
+                "type": getattr(d, 'type', None),
+                "comment": getattr(d, 'comment', None),
+                "magic": getattr(d, 'magic', None)
             })
 
         return jsonify({"deals": deal_list})

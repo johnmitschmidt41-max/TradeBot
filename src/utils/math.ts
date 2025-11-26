@@ -23,6 +23,13 @@ export function highest(candles: Candle[], lookback: number) {
   return Math.max(...slice.map(c => c.high));
 }
 
+export function sma(candles: Candle[], length: number): number {
+  if (!candles || candles.length < length) return 0;
+  const slice = candles.slice(-length);
+  const sum = slice.reduce((acc, c) => acc + c.close, 0);
+  return sum / slice.length;
+}
+
 export function lowest(candles: Candle[], lookback: number) {
   const slice = candles.slice(-lookback);
   return Math.min(...slice.map(c => c.low));

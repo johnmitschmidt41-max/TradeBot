@@ -16,6 +16,7 @@ export class OrderManager {
         price: req.price,
         sl: req.sl ?? 0,
         tp: req.tp ?? 0,
+        comment: req.comment
       });
       info('Order result', res);
       return res;
@@ -34,6 +35,7 @@ export class OrderManager {
     volume: number;
     sl: number;
     tp: number;
+    comment?: string;
   }) {
     try {
       info('Placing MARKET order', req);
@@ -44,6 +46,7 @@ export class OrderManager {
         price: 0, // 0 = market order
         sl: req.sl ?? 0,
         tp: req.tp ?? 0,
+        comment: req.comment
       });
       info('Order result', res);
       return res;

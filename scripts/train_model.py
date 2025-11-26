@@ -127,6 +127,16 @@ def main():
     out = Path(args.output)
     out.parent.mkdir(parents=True, exist_ok=True)
     joblib.dump(model, out)
+    # persist feature column list so the scorer can featurize inputs consistently
+    features_file = out.parent.joinpath('model_features.json')
+    try:
+        import json
+        cols = X.columns.tolist()
+        with features_file.open('w', encoding='utf8') as fh:
+            json.dump({'feature_columns': cols}, fh)
+        print('Saved feature column list to', features_file)
+    except Exception as e:
+        print('Failed to save feature columns:', e)
     print('Saved model to', out)
 
 

@@ -41,8 +41,30 @@ export const STRATEGY_CONFIG = {
     }
   },
   tp: {
-    minRR: 2.0,
+    minRR: 2.5,
     useTrailingStop: true
+  },
+  filters: {
+    // Trend filter toggles and MA lengths (short MA must be above long MA for buys)
+    trendEnabled: true,
+    maShort: 50,
+    maLong: 200,
+    // Liquidity checks: require ATR (pips) to be above a minimum to consider a trade
+    liquidityEnabled: true,
+    minAtrPipsFX: 2.5,   // FX pairs minimum ATR in pips
+    minAtrPipsXAU: 30,   // Gold minimum ATR in pips
+    // volume: require current bar volume to be >= avgVolume * multiplier
+    minVolumeMultiplier: 0.8
+  },
+  // Matching options used when trying to stitch closed deals back to earlier
+  // placed signals in `trade_signals.jsonl`. Default is small (3 pips) for FX
+  // pairs; XAU tends to require a much larger tolerance because its price
+  // precision & move scale differs.
+  matching: {
+    defaultTolerancePips: 3,
+    perSymbolTolerance: {
+      XAUUSDz: 30
+    }
   },
   news: {
     blockBeforeMinutes: 30,
@@ -53,7 +75,32 @@ export const STRATEGY_CONFIG = {
     useLimitOrders: true,
     limitOffsetPips: 0.5
   }
+  ,
+  // High-frequency scanning options (M5). Disabled by default — enable when you
+  // want higher throughput with stricter gating (HTF confirmation and stricter
+  // ML thresholds). Keep M5 smaller lot sizing to maintain overall daily risk.
+  highFrequency: {
+    // ENABLED: M5 high-frequency scanning (HTF confirm + stricter ML gating)
+    enabled: true,
+    timeframe: 'M5',
+    // require the higher timeframe trend be aligned (M15 or H1) for M5-triggered signals
+    htfConfirm: 'M15',
+    // reduce allowable ML loss probability for M5 signals (stricter gating)
+    // Stricter ML threshold for M5 (lower == harder to get a pass)
+    mlMaxLossProb: 0.30,
+    // scale lots when trading in M5 (so M5 doesn't increase daily risk)
+    // smaller lot sizing for M5 so overall daily risk is preserved
+    m5ScalingFactor: 0.25,
+    // global daily cap across all symbols for M5 mode and per-symbol overrides
+    globalDailyCap: 150,
+    perSymbolDailyCap: {
+      default: 30,
+      // tighter cap for gold (avoid overexposure while testing M5)
+      XAUUSDz: 10
+    }
+  }
 };
+
 
 // ML scoring configuration (optional) — disabled by default
 export const ML_CONFIG = {

@@ -8,17 +8,17 @@ import { detectFVG, FVG } from "../detectors/fvg-detector";
 import { detectSweeps } from "../detectors/sweep-detector";
 import { detectRejection } from "../detectors/rejection-detector";
 import { computeVolume, pipValuePerLot, getSymbolMeta } from "../core/position-sizing";
-import { persistTradeSignal } from "../core/trade-storage";
+import { persistTradeSignal, persistTradeSignalWithCid, updateSignalByCid, markSignalClosedByDeal } from "../core/trade-storage";
 import { scoreWithRemoteModel } from '../core/ai-client';
 import { ML_CONFIG } from '../config/strategy';
-import { canOpenTrade, logTrade } from "../core/trade-filter";
+import { canOpenTrade, logTrade, markOpenPosition, markClosePosition, getTradesTodayCount } from "../core/trade-filter";
 import { info, warn } from "../utils/logger";
 import { priceToPip } from "../utils/pip";
-import { atr } from "../utils/math";
+import { atr, sma } from "../utils/math";
 import { Candle } from "../utils/types";
 import path from 'path';
 
-const SYMBOLS = ["GBPUSDz", "EURUSDz", "XAUUSDz"];
+const SYMBOLS = ["GBPUSDz", "EURUSDz", "XAUUSDz", "USDJPYz"];
 
 export class Strategy {
   dataFeed: DataFeed;
@@ -53,6 +53,112 @@ export class Strategy {
     return nearby[0];
   }
 
+  // Lightweight high-frequency (M5) pass — tries to capture fast opportunities
+  // with HTF confirmation and stricter ML gating + lot-scaling.
+  private async attemptHighFreq(symbol: string, timeframe: string) {
+    // quick fetch
+    const candles: Candle[] = await this.dataFeed.getRecentCandles(symbol, timeframe, 300);
+    if (!candles || candles.length < 50) return;
+
+    const recentSweeps = detectSweeps(candles, STRATEGY_CONFIG.sweep.thresholdPips, symbol).slice(-8);
+    if (!recentSweeps || recentSweeps.length === 0) return;
+
+    const latest = recentSweeps[recentSweeps.length - 1];
+    const side = latest.side;
+
+    // per-symbol daily cap (best-effort in-memory check)
+    const perCap = (STRATEGY_CONFIG.highFrequency?.perSymbolDailyCap && (STRATEGY_CONFIG.highFrequency?.perSymbolDailyCap as any)[symbol]) ?? STRATEGY_CONFIG.highFrequency?.perSymbolDailyCap?.default ?? 30;
+    const todayCount = getTradesTodayCount(symbol);
+    if (todayCount >= perCap) {
+      info(`M5 skipping ${symbol} because cap reached (${todayCount} >= ${perCap})`);
+      return;
+    }
+
+    // HTF confirmation
+    const htf = STRATEGY_CONFIG.highFrequency?.htfConfirm ?? 'M15';
+    try {
+      const htfCandles = await this.dataFeed.getRecentCandles(symbol, htf, 200);
+      if (htfCandles && htfCandles.length > 20 && STRATEGY_CONFIG.filters?.trendEnabled) {
+        const maShort = sma(htfCandles, STRATEGY_CONFIG.filters?.maShort || 50);
+        const maLong = sma(htfCandles, STRATEGY_CONFIG.filters?.maLong || 200);
+        if (maShort === 0 || maLong === 0) {
+          // not enough HTF history — bail
+          return;
+        }
+        if (side === 'BUY' && maShort <= maLong) return;
+        if (side === 'SELL' && maShort >= maLong) return;
+      }
+    } catch (e:any) {
+      // HTF fetch failed — don't proceed with high freq attempt
+      warn('M5 HTF fetch failed', e?.message ?? e);
+      return;
+    }
+
+    const currentPrice = candles[candles.length - 1].close;
+
+    if (!await canOpenTrade(this.connector, symbol, side)) return;
+
+    // select FVG candidate
+    const fvgs = detectFVG(candles, STRATEGY_CONFIG.fvg.minGapPips, symbol);
+    const atrVal = atr(candles, 20) || (symbol.includes('XAU') || symbol.includes('JPY') ? 0.01 : 0.0001) * 100;
+    const dynamicMaxDistance = Math.max(symbol.includes('XAU') ? 80 : 50, Math.round(priceToPip(symbol, atrVal) * (symbol.includes('XAU') ? 2.5 : 2.0)));
+    const candidate = this.pickNearestValidFVG(fvgs, currentPrice, symbol, dynamicMaxDistance);
+    if (!candidate) return;
+
+    const entry = (currentPrice >= candidate.low && currentPrice <= candidate.high) ? currentPrice : (side === 'BUY' ? candidate.low : candidate.high);
+
+    // compute sl/tp and lots
+    const pipSize = (symbol.includes('XAU') || symbol.includes('JPY')) ? 0.01 : 0.0001;
+    const slBuffer = symbol.includes('XAU') ? 200 : 10;
+    const sl = side === 'BUY' ? entry - (slBuffer * pipSize) : entry + (slBuffer * pipSize);
+    const tp = side === 'BUY' ? entry + (STRATEGY_CONFIG.tp.minRR * Math.abs(entry - sl)) : entry - (STRATEGY_CONFIG.tp.minRR * Math.abs(sl - entry));
+    const slDistance = priceToPip(symbol, Math.abs(entry - sl));
+    if (slDistance < 2) return;
+
+    const accountInfo = await this.connector.getAccountInfo();
+    const accountBalance = accountInfo?.balance ?? 100;
+    let lots = computeVolume(accountBalance, STRATEGY_CONFIG.risk.riskPercent, slDistance, symbol);
+    lots = Math.round((lots * (STRATEGY_CONFIG.risk?.scalingFactor ?? 1) * (STRATEGY_CONFIG.highFrequency?.m5ScalingFactor ?? 0.3)) * 100) / 100;
+    if (lots < 0.01) return;
+
+    // quick model scoring with stricter threshold
+    if (ML_CONFIG?.enabled) {
+      try {
+        const score = await scoreWithRemoteModel({ symbol, side, entry, sl, tp, lots, accountBalance, slPips: slDistance });
+        const thr = STRATEGY_CONFIG.highFrequency?.mlMaxLossProb ?? ML_CONFIG.declineLossProb ?? 0.6;
+        if (!score || typeof score.lossProb !== 'number' || score.lossProb >= thr) return;
+      } catch (e:any) {
+        // scoring failed -> skip M5 attempt
+        warn('M5 scoring failed', e?.message ?? e);
+        return;
+      }
+    }
+
+    // persist quick signal with CID and place an order
+    let cid: string | null = null;
+    try {
+      cid = persistTradeSignalWithCid({ time: Math.floor(Date.now()/1000), symbol, side, orderType: 'MARKET', entry: +entry, price: +entry, sl: +sl, tp: +tp, lots, status: 'placed' });
+    } catch (e) {}
+
+    try {
+      const params: any = { symbol, type: side as 'BUY'|'SELL', volume: lots, sl, tp };
+      if (cid) params.comment = cid;
+      const res = await this.orderManager.placeMarketOrder(params);
+      if (res?.success) {
+        try {
+          if (cid) updateSignalByCid(cid, { order: res.order, deal: res.deal });
+        } catch (e:any) {
+          warn('Failed to attach order id for M5 signal', e?.message ?? e);
+        }
+        markOpenPosition(symbol, side);
+        logTrade(symbol, side);
+        info(`M5 placed ${symbol} ${side} lots=${lots}`);
+      }
+    } catch (e:any) {
+      warn('M5 place order failed', e?.message ?? e);
+    }
+  }
+
   async scanAndAct() {
     // Check for recently closed deals and persist their results for training data
     try {
@@ -65,20 +171,39 @@ export class Strategy {
     }
     for (const symbol of SYMBOLS) {
       try {
+        // If high-frequency M5 mode is enabled, attempt a fast M5 pass first
+        if (STRATEGY_CONFIG.highFrequency?.enabled) {
+          try {
+            await this.attemptHighFreq(symbol, STRATEGY_CONFIG.highFrequency.timeframe || 'M5');
+          } catch (err:any) {
+            warn('M5 pass error', err?.message ?? err);
+          }
+        }
+
         const candles: Candle[] = await this.dataFeed.getRecentCandles(symbol, STRATEGY_CONFIG.timeframe, 500);
-        if (!candles || candles.length < 50) continue;
+        if (!candles || candles.length < 50) {
+          info(`Insufficient candles for ${symbol} (have=${candles?.length ?? 0}). Skipping.`);
+          continue;
+        }
 
         const currentCandle = candles[candles.length - 1];
         const currentPrice = currentCandle.close;
-        const pipSize = symbol.includes('XAU') ? 0.01 : 0.0001;
+        const pipSize = (symbol.includes('XAU') || symbol.includes('JPY')) ? 0.01 : 0.0001;
 
         const poi = detectPOI(candles, STRATEGY_CONFIG.lookback, STRATEGY_CONFIG.poi.zoneThicknessATR, STRATEGY_CONFIG.poi.minTouches);
         const fvgs = detectFVG(candles, STRATEGY_CONFIG.fvg.minGapPips, symbol);
         const sweeps = detectSweeps(candles, STRATEGY_CONFIG.sweep.thresholdPips, symbol);
         const rejections = detectRejection(candles, STRATEGY_CONFIG.rejection.wickPercent, STRATEGY_CONFIG.rejection.bodyPercent);
 
+        // Early liquidity indicator — ATR in pips (used by liquidity filter below)
+        const atrVal = atr(candles, 20) || pipSize * 100;
+        const atrPips = priceToPip(symbol, atrVal);
+
         const recentSweeps = sweeps.slice(-10);
-        if (recentSweeps.length === 0) continue;
+        if (recentSweeps.length === 0) {
+          info(`No recent sweeps found for ${symbol} — strategy skipping.`);
+          continue;
+        }
         
         const latestSweep = recentSweeps[recentSweeps.length - 1];
         const side = latestSweep.side;
@@ -90,12 +215,63 @@ export class Strategy {
           continue;
         }
 
+        // --- Trend and Liquidity Filters ---
+        const filters = STRATEGY_CONFIG.filters ?? {} as any;
+        if (filters.trendEnabled) {
+          const maShort = sma(candles, filters.maShort || 50);
+          const maLong = sma(candles, filters.maLong || 200);
+
+          if (maShort === 0 || maLong === 0) {
+            info('Not enough history for MA trend filter, skipping trend check.');
+          } else {
+            if (side === 'BUY' && maShort <= maLong) {
+              info(`Against trend (MA${filters.maShort} <= MA${filters.maLong}) — skipping ${symbol} ${side}`);
+              continue;
+            }
+            if (side === 'SELL' && maShort >= maLong) {
+              info(`Against trend (MA${filters.maShort} >= MA${filters.maLong}) — skipping ${symbol} ${side}`);
+              continue;
+            }
+          }
+        }
+
+        if (filters.liquidityEnabled) {
+          // require a minimum ATR and reasonable recent tick volume
+          const recentVol = candles.slice(-50).map(c => c.volume);
+          const avgVol = recentVol.reduce((a, b) => a + b, 0) / Math.max(1, recentVol.length);
+          const currVol = currentCandle.volume || 0;
+
+          const minAtr = symbol.includes('XAU') ? (filters.minAtrPipsXAU ?? 30) : (filters.minAtrPipsFX ?? 2.5);
+          if (atrPips < minAtr) {
+            info(`Low liquidity (ATR ${atrPips.toFixed(1)} pips < min ${minAtr}) — skipping ${symbol}`);
+            continue;
+          }
+
+          const volThresh = Math.max(1, (filters.minVolumeMultiplier ?? 0.8) * avgVol);
+          if (currVol < volThresh) {
+            info(`Low tick volume (${currVol} < avg*mult ${volThresh.toFixed(1)}) — skipping ${symbol}`);
+            continue;
+          }
+        }
+
         // ✅ CHECK IF POSITION OR PENDING ORDER ALREADY EXISTS
         const openPositions = await this.connector.getOpenPositions(symbol);
         const pendingOrders = await this.connector.getPendingOrders(symbol);
 
         const hasOpenPosition = openPositions.some((pos: any) => pos.type === side);
         const hasPendingOrder = pendingOrders.some((order: any) => order.type === side);
+        const oppositeOpen = openPositions.some((pos: any) => pos.type !== side);
+        const oppositePending = pendingOrders.some((order: any) => order.type !== side);
+
+        if (oppositeOpen) {
+          info(`Opposite-side position already running for ${symbol}. Skipping.`);
+          continue;
+        }
+
+        if (oppositePending) {
+          info(`Opposite-side pending order already exists for ${symbol}. Skipping.`);
+          continue;
+        }
 
         if (hasOpenPosition) {
           info(`Already have open ${side} position on ${symbol}. Skipping.`);
@@ -108,8 +284,6 @@ export class Strategy {
         }
 
         // --- ATR-based dynamic distance cap ---
-        const atrVal = atr(candles, 20) || pipSize * 100;
-        const atrPips = priceToPip(symbol, atrVal);
 
         const baseMin = symbol.includes('XAU') ? 80 : 50;
         const scale = symbol.includes('XAU') ? 2.5 : 2.0;
@@ -242,9 +416,12 @@ export class Strategy {
         const globalMax = STRATEGY_CONFIG.risk?.maxLots ?? 50;
         lots = Math.min(Math.max(lots, 0.01), globalMax);
 
-        // Persist the proposed signal before trying to place — this helps build training data
+        // Persist the proposed signal (with a client id) before trying to place —
+        // we will attach broker order/deal ids after placement to enable
+        // deterministic matching later.
+        let cid: string | null = null;
         try {
-          persistTradeSignal({
+          cid = persistTradeSignalWithCid({
             time: Math.floor(Date.now() / 1000),
             symbol,
             side,
@@ -338,24 +515,35 @@ export class Strategy {
           modelScore
         });
 
+        let placeRes: any = null;
         if (useMarketOrder) {
-          await this.orderManager.placeMarketOrder({
-            symbol,
-            type: side,
-            volume: lots,
-            sl: slPrice,
-            tp: tpPrice
-          });
+          const params: any = { symbol, type: side, volume: lots, sl: slPrice, tp: tpPrice };
+          if (cid) params.comment = cid;
+          placeRes = await this.orderManager.placeMarketOrder(params);
         } else {
-          await this.orderManager.placeLimitOrder({
-            symbol,
-            type: side,
-            volume: lots,
-            price: entry,
-            sl: slPrice,
-            tp: tpPrice
-          });
+          const params: any = { symbol, type: side, volume: lots, price: entry, sl: slPrice, tp: tpPrice };
+          if (cid) params.comment = cid;
+          placeRes = await this.orderManager.placeLimitOrder(params);
         }
+
+        // If order was successful, mark this symbol/side as running in memory
+        try {
+          if (placeRes?.success) {
+            markOpenPosition(symbol, side);
+            // attach returned order/deal ids back to the persisted signal (best-effort)
+            try {
+              if (cid) {
+                updateSignalByCid(cid, { order: placeRes.order, deal: placeRes.deal });
+              }
+            } catch (e:any) {
+              warn('Failed to update persisted signal with order id', e?.message ?? e);
+            }
+          }
+        } catch (err:any) {
+          // non-fatal - just log
+          warn('Failed to mark open position in memory', err?.message ?? err);
+        }
+        
 
         logTrade(symbol, side);
 
@@ -375,6 +563,10 @@ export class Strategy {
     const deals = await this.connector.getDeals(since);
     if (!deals || deals.length === 0) return;
 
+    info(`Fetched ${deals.length} closed deals from bridge since=${since}`);
+    let newSaved = 0;
+    let updatedExisting = 0;
+
     for (const d of deals) {
       // Expected shape from bridge: {deal, order, symbol, time, price, volume, profit, type}
       try {
@@ -384,6 +576,19 @@ export class Strategy {
 
         const status = 'closed';
         const profit = typeof d.profit === 'number' ? d.profit : Number(d.profit) || 0;
+
+        // try to update an existing placed signal (best-effort) based on deal price
+        try {
+          const dealSymbol = (d.symbol ?? d.symbol_name ?? 'UNKNOWN') as string;
+          const defaultTol = STRATEGY_CONFIG.matching?.defaultTolerancePips ?? 3;
+          const perSym = STRATEGY_CONFIG.matching?.perSymbolTolerance ?? {} as any;
+          const perSymAny = perSym as any;
+          const tol = perSymAny[dealSymbol] ?? perSymAny[dealSymbol?.replace('z','')] ?? defaultTol;
+          const didUpdate = markSignalClosedByDeal(d, { priceTolerancePips: tol });
+          if (didUpdate) updatedExisting++;
+        } catch (e) {
+          // ignore
+        }
 
         persistTradeSignal({
           time: t,
@@ -405,19 +610,34 @@ export class Strategy {
           result: { profit, closedTime: t, reason: 'history_deal' }
         });
 
+        // mark closed in-memory positions if any
+        try {
+          const closedSide = (d.type === 0 || String(d.type).toUpperCase().includes('BUY')) ? 'BUY' : 'SELL';
+          markClosePosition(d.symbol ?? d.symbol_name ?? 'UNKNOWN', closedSide);
+        } catch (e) {
+          // ignore
+        }
+
+        newSaved++;
         // update last processed timestamp
         if (t > this.lastDealTimestamp) this.lastDealTimestamp = t;
       } catch (e) {
         // ignore per-deal errors
       }
     }
+    info(`persisted ${newSaved} closed deals (updatedExisting=${updatedExisting})`);
 
     // After persisting close records, attempt to trigger retrain if enabled
     try {
       // eslint-disable-next-line @typescript-eslint/no-var-requires
       const { triggerRetrainIfNeeded } = require('../core/retrainer');
       const signalsPath = path.join(__dirname, '..', '..', 'data', 'output', 'trade_signals.jsonl');
-      triggerRetrainIfNeeded(signalsPath);
+      if (updatedExisting > 0) {
+        // only trigger retrain if we actually matched/updated placed signals
+        triggerRetrainIfNeeded(signalsPath);
+      } else {
+        info('No placed signals were updated by deals — skipping retrain trigger.');
+      }
     } catch (err:any) {
       // ignore retrain scheduling failures
     }

@@ -8,7 +8,10 @@
     "dev": "ts-node-dev --respawn src/index.ts",
     "build": "tsc",
     "start": "node dist/index.js",
-    "backtest": "ts-node src/backtester/backtest-runner.ts"
+    "backtest": "ts-node src/backtester/backtest-runner.ts",
+    "replay:m5": "ts-node src/backtester/m5-replay.ts",
+    "train": "python ./scripts/train_model.py --input ./data/output/trade_signals.jsonl --output ./data/output/model.pkl",
+    "scorer": "python ./scripts/scorer_server.py --model ./data/output/model.pkl --port 5100"
   },
   "dependencies": {
     "axios": "^1.6.0",

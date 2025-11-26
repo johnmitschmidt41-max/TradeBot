@@ -1,7 +1,13 @@
 // src/core/mt5-connector.ts
 import axios from 'axios';
 
-const MT5_BRIDGE_URL = 'http://163.5.210.176:5000';
+// Allow overriding the bridge URL with environment variable (use local fallback)
+const MT5_BRIDGE_URL = (process.env.MT5_BRIDGE || process.env.MT5_BRIDGE_URL || 'http://127.0.0.1:5000').replace(/\/+$/,'');
+
+function logConnectorError(context: string, err: any) {
+  const msg = err?.response?.data ?? err?.message ?? String(err);
+  console.warn(`[mt5-connector] ${context} failed:`, msg);
+}
 
 export interface Candle {
   time: number;
@@ -40,12 +46,17 @@ export class MT5Connector {
   }
 
   async getCandles(symbol: string, timeframe: string, count: number): Promise<Candle[]> {
-    const response = await axios.post(`${MT5_BRIDGE_URL}/candles`, {
+    try {
+      const response = await axios.post(`${MT5_BRIDGE_URL}/candles`, {
       symbol,
       timeframe,
       count
-    });
-    return response.data.candles;
+      });
+      return response.data.candles;
+    } catch (err:any) {
+      logConnectorError('/candles', err);
+      throw err;
+    }
   }
 
   async placeOrder(params: {
@@ -55,15 +66,26 @@ export class MT5Connector {
     price?: number;
     sl: number;
     tp: number;
+    comment?: string;
   }): Promise<any> {
-    const response = await axios.post(`${MT5_BRIDGE_URL}/order`, params);
-    return response.data;
+    try {
+      const response = await axios.post(`${MT5_BRIDGE_URL}/order`, params);
+      return response.data;
+    } catch (err:any) {
+      logConnectorError('/order', err);
+      throw err;
+    }
   }
 
   // Backwards-compatible: returns all positions or positions for symbol
   async getPositions(): Promise<any[]> {
-    const response = await axios.get(`${MT5_BRIDGE_URL}/positions`);
-    return response.data.positions || [];
+    try {
+      const response = await axios.get(`${MT5_BRIDGE_URL}/positions`);
+      return response.data.positions || [];
+    } catch (err:any) {
+      logConnectorError('/positions', err);
+      throw err;
+    }
   }
 
   async getOpenPositions(symbol?: string): Promise<any[]> {
@@ -71,8 +93,13 @@ export class MT5Connector {
       ? `${MT5_BRIDGE_URL}/positions?symbol=${symbol}`
       : `${MT5_BRIDGE_URL}/positions`;
     
-    const response = await axios.get(url);
-    return response.data.positions || [];
+    try {
+      const response = await axios.get(url);
+      return response.data.positions || [];
+    } catch (err:any) {
+      logConnectorError('/positions?symbol', err);
+      throw err;
+    }
   }
 
   async getPendingOrders(symbol?: string): Promise<any[]> {
@@ -80,21 +107,36 @@ export class MT5Connector {
       ? `${MT5_BRIDGE_URL}/orders?symbol=${symbol}`
       : `${MT5_BRIDGE_URL}/orders`;
     
-    const response = await axios.get(url);
-    return response.data.orders || [];
+    try {
+      const response = await axios.get(url);
+      return response.data.orders || [];
+    } catch (err:any) {
+      logConnectorError('/orders?symbol', err);
+      throw err;
+    }
   }
 
   // NEW: account info (balance, equity, etc.)
   async getAccountInfo(): Promise<AccountInfo | null> {
-    const response = await axios.get(`${MT5_BRIDGE_URL}/account`);
-    return response.data.account ?? null;
+    try {
+      const response = await axios.get(`${MT5_BRIDGE_URL}/account`);
+      return response.data.account ?? null;
+    } catch (err:any) {
+      logConnectorError('/account', err);
+      return null;
+    }
   }
 
   // Fetch closed deal history (optionally since epoch seconds)
   async getDeals(since?: number): Promise<any[]> {
     const url = typeof since === 'number' ? `${MT5_BRIDGE_URL}/deals?since=${since}` : `${MT5_BRIDGE_URL}/deals`;
-    const response = await axios.get(url);
-    return response.data.deals || [];
+    try {
+      const response = await axios.get(url);
+      return response.data.deals || [];
+    } catch (err:any) {
+      logConnectorError('/deals', err);
+      throw err; // Let callers handle retries
+    }
   }
 
   // NEW: convenience wrapper for all open positions (alias)
