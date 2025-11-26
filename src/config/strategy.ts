@@ -20,7 +20,7 @@ export const STRATEGY_CONFIG = {
     bodyPercent: 0.3
   },
   risk: {
-    riskPercent: 10,  // 10% risk per trade
+    riskPercent: 3,  // 3% risk per trade (user requested)
     // scalingFactor multiplies computed lots (use 1 for no scaling). Keep small (1-3) for safety.
     scalingFactor: 1,
     // fallback leverage used if account info doesn't include it
@@ -31,6 +31,15 @@ export const STRATEGY_CONFIG = {
     maxSimultaneousTrades: 3,
     directionCooldownSeconds: 300,
     maxTradesPerDay: 50 // base is 5-10 max
+    ,
+    // If enabled (and combined with PAPER_MODE or DEBUG_RISK_OVERRIDE env var),
+    // the bot will allow opening a trade when the risk-based cap is zero but
+    // other constraints (e.g., margin) allow a positive lot size. Use cautiously.
+    // Allow demo or PAPER_MODE runs to proceed even when the strict risk cap
+    // computes to zero (helps with small balance/demo or broker rounding quirks).
+    // This should be used cautiously in live trading. The strategy logic will
+    // also allow DEBUG_RISK_OVERRIDE or PAPER_MODE env vars to bypass risk.
+    allowNonZeroLotsEvenIfRiskZero: true
   },
   sl: {
     // ✅ FIXED: Symbol-specific SL distances
@@ -44,6 +53,14 @@ export const STRATEGY_CONFIG = {
     minRR: 2.5,
     useTrailingStop: true
   },
+  // Trailing stop configuration: activate at 1:1 and 1:2 milestones
+  trailingStop: {
+    enabled: true,
+    // At 1:1 (breakeven + slippage), activate trailing stop with this pip distance
+    trailingAtBreakeven: 5,      // 5 pips trailing at 1:1
+    // At 1:2 (TP/2), tighten trailing to this distance
+    trailingAtHalfTP: 3         // 3 pips trailing at 1:2
+  },
   filters: {
     // Trend filter toggles and MA lengths (short MA must be above long MA for buys)
     trendEnabled: true,
@@ -54,7 +71,14 @@ export const STRATEGY_CONFIG = {
     minAtrPipsFX: 2.5,   // FX pairs minimum ATR in pips
     minAtrPipsXAU: 30,   // Gold minimum ATR in pips
     // volume: require current bar volume to be >= avgVolume * multiplier
-    minVolumeMultiplier: 0.8
+    minVolumeMultiplier: 0.8,
+    // allowLowVolume: globally allow trading even when tick-volume < avg*mult
+    // NOT recommended for live accounts, useful for paper/demo or high-frequency
+    // testing. You can also set perSymbolAllowLowVolume to tune specific symbols.
+    allowLowVolume: false,
+    perSymbolAllowLowVolume: {
+      // e.g. GBPUSDz: true
+    }
   },
   // Matching options used when trying to stitch closed deals back to earlier
   // placed signals in `trade_signals.jsonl`. Default is small (3 pips) for FX
@@ -109,7 +133,14 @@ export const ML_CONFIG = {
   // environment variable names for provider URL / key
   apiUrlEnv: 'GEMINI_API_URL',
   apiKeyEnv: 'GEMINI_API_KEY',
-  // if model predicts a loss probability >= this value, skip the trade
+  // Quick gating mode to control ML strictness. Choose one of:
+  // 'strict' -> allow trades when lossProb <= 0.50 (higher volume, ~35-40% win rate)
+  // 'medium' -> allow trades when lossProb <= 0.60 (10-15 trades/day, ~30% win rate)
+  // 'loose' -> allow trades when lossProb <= 0.70 (very high volume, ~25% win rate)
+  // The computed numeric threshold will be used unless overridden by
+  // higher-priority config (e.g., STRATEGY_CONFIG.highFrequency.mlMaxLossProb)
+  gatingMode: 'medium',
+  // legacy numeric fallback (used when explicit gating mode is not provided)
   declineLossProb: 0.6
 };
 
@@ -118,10 +149,10 @@ export const AUTO_TRAINING_CONFIG = {
   enabled: true, // set to true to run retraining after every closed trade
   // path to python interpreter/command to run the trainer
   pythonCommand: 'python',
-  // script to run (relative to project root)
-  trainScript: 'scripts/train_model.py',
-  // model output path (trainer will write here)
-  modelOutput: 'data/output/model.pkl',
+  // script to run (relative to project root) — use winners-only trainer for better accuracy
+  trainScript: 'scripts/train_model_winners_only.py',
+  // model output path (trainer will write here) — saves to model_winners.pkl
+  modelOutput: 'data/output/model_winners.pkl',
   // minimum number of closed trades required before training runs (avoid tiny samples)
-  minSamples: 1
+  minSamples: 5  // retrain after every 5 closed trades
 };

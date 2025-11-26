@@ -20,6 +20,22 @@ import path from 'path';
 
 const SYMBOLS = ["GBPUSDz", "EURUSDz", "XAUUSDz", "USDJPYz"];
 
+// Map user-friendly gating modes to numeric maximum allowed loss probability.
+function mlModeToThreshold(mode?: string | null): number | null {
+  if (!mode) return null;
+  const m = (mode || '').toString().toLowerCase();
+  switch (m) {
+    case 'strict':
+      return 0.50; // higher volume: allow when lossProb <= 0.50 (35-40% win)
+    case 'medium':
+      return 0.60; // 10-15 trades/day: allow when lossProb <= 0.60 (30% win)
+    case 'loose':
+      return 0.70; // very high volume: allow when lossProb <= 0.70 (25% win)
+    default:
+      return null;
+  }
+}
+
 export class Strategy {
   dataFeed: DataFeed;
   orderManager: OrderManager;
@@ -125,8 +141,12 @@ export class Strategy {
     if (ML_CONFIG?.enabled) {
       try {
         const score = await scoreWithRemoteModel({ symbol, side, entry, sl, tp, lots, accountBalance, slPips: slDistance });
-        const thr = STRATEGY_CONFIG.highFrequency?.mlMaxLossProb ?? ML_CONFIG.declineLossProb ?? 0.6;
-        if (!score || typeof score.lossProb !== 'number' || score.lossProb >= thr) return;
+        // Respect explicit HF override (mlMaxLossProb); otherwise derive threshold from
+        // global gating mode (strict/medium/loose) or fall back to declineLossProb.
+        const modeThr = mlModeToThreshold(ML_CONFIG?.gatingMode);
+        const thr = STRATEGY_CONFIG.highFrequency?.mlMaxLossProb ?? modeThr ?? ML_CONFIG.declineLossProb ?? 0.6;
+        // allow trade when lossProb <= thr (skip when lossProb > thr)
+        if (!score || typeof score.lossProb !== 'number' || score.lossProb > thr) return;
       } catch (e:any) {
         // scoring failed -> skip M5 attempt
         warn('M5 scoring failed', e?.message ?? e);
@@ -248,9 +268,12 @@ export class Strategy {
           }
 
           const volThresh = Math.max(1, (filters.minVolumeMultiplier ?? 0.8) * avgVol);
-          if (currVol < volThresh) {
+          const perAllow = (filters.perSymbolAllowLowVolume && (filters.perSymbolAllowLowVolume as any)[symbol]) ?? false;
+          if (currVol < volThresh && !(filters.allowLowVolume || perAllow)) {
             info(`Low tick volume (${currVol} < avg*mult ${volThresh.toFixed(1)}) — skipping ${symbol}`);
             continue;
+          } else if (currVol < volThresh && (filters.allowLowVolume || perAllow)) {
+            info(`Low tick volume (${currVol} < avg*mult ${volThresh.toFixed(1)}) — OVERRIDDEN (allowLowVolume) — continuing ${symbol}`);
           }
         }
 
@@ -375,6 +398,9 @@ export class Strategy {
         // apply scaling factor
         let lots = Math.round(baseLots * scaleFactor * 100) / 100;
 
+        // Debug: show sizing inputs so operator can trace why some signals produce lots < 0.01
+        info('sizing debug', { symbol, accountBalance, slDistance, tpDistance, baseLots, scaleFactor });
+
         // Safety clamp: ensure final risk (lots * riskPerLotUSD) never exceeds configured riskUSD
         const pipValue = pipValuePerLot(symbol);
         const riskUSD = accountBalance * (STRATEGY_CONFIG.risk.riskPercent / 100);
@@ -404,7 +430,22 @@ export class Strategy {
         }
 
         // clamp to risk-based maximum and margin-based maximum
+        const beforeClamp = lots;
         lots = Math.min(lots, maxLotsByRisk, maxLotsByMargin || 0);
+
+        // Debug: show detailed sizing values to diagnose why risk-based cap was zero
+        info('sizing debug', { symbol, accountBalance, slDistance, tpDistance, baseLots, scaleFactor, beforeClamp, maxLotsByRisk, maxLotsByMargin, finalLotsBeforeMin: lots });
+
+        // Optional override: allow opening when maxByRisk==0 but baseLots > 0
+        const allowRiskOverride = STRATEGY_CONFIG.risk?.allowNonZeroLotsEvenIfRiskZero === true
+          || process.env.DEBUG_RISK_OVERRIDE === 'true'
+          || process.env.PAPER_MODE === 'true';
+
+        if (lots <= 0 && allowRiskOverride && baseLots > 0) {
+          // honor margin cap but ignore risk cap
+          lots = Math.min(baseLots, maxLotsByMargin || baseLots);
+          info('risk override applied - using baseLots despite maxByRisk=0', { symbol, baseLots, lots, maxLotsByMargin });
+        }
 
         // If margin prevents any meaningful lot, skip the trade
         if (lots < 0.01) {
@@ -461,7 +502,11 @@ export class Strategy {
               fvgDistancePips: distanceToFVG
             });
 
-            if (modelScore && modelScore.lossProb >= (ML_CONFIG?.declineLossProb ?? 0.6)) {
+            // compute threshold for normal pass: check explicit HF perf override first,
+            // then derive from gatingMode and fall back to numeric declineLossProb value.
+            const modeThrMain = mlModeToThreshold(ML_CONFIG?.gatingMode);
+            const allowedThr = STRATEGY_CONFIG.highFrequency?.mlMaxLossProb ?? modeThrMain ?? (ML_CONFIG?.declineLossProb ?? 0.6);
+            if (modelScore && modelScore.lossProb > allowedThr) {
               // persist that we skipped this signal due to model
               persistTradeSignal({
                 time: Math.floor(Date.now() / 1000),

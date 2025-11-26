@@ -23,6 +23,13 @@ export async function scoreWithRemoteModel(payload: SignalPayload): Promise<{ lo
     let res;
     try {
       res = await axios.post(url, payload, { headers, timeout: 15_000 });
+      // debug: log successful response body for observability
+      try {
+        // eslint-disable-next-line no-console
+        console.debug('[ai-client] scorer response:', res?.status, res?.data);
+      } catch (e) {
+        // ignore
+      }
     } catch (firstErr:any) {
       // If we got a 404 from the exact URL, and the configured URL doesn't end
       // with '/score', try appending '/score' as a fallback to handle users
@@ -51,6 +58,13 @@ export async function scoreWithRemoteModel(payload: SignalPayload): Promise<{ lo
 
     // Expect provider to return JSON { lossProb: number } or similar
     if (res && res.data) {
+      // Log scorer response so operators can see predictions in the bot console
+      try {
+        // eslint-disable-next-line no-console
+        console.info('[ai-client] scorer response', res.status, res.data);
+      } catch (e) {
+        // ignore
+      }
       const d = res.data as any;
       if (typeof d.lossProb === 'number') return { lossProb: d.lossProb };
       // fall back: provider may return score or probability fields
