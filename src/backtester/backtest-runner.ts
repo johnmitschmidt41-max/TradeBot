@@ -1,6 +1,7 @@
 // src/backtester/backtest-runner.ts
 import { Candle } from "../utils/types";
 import { detectFVG } from "../detectors/fvg-detector";
+import { pipToPrice } from "../utils/pip";
 import { detectSweeps } from "../detectors/sweep-detector";
 import { detectRejection } from "../detectors/rejection-detector";
 
@@ -30,7 +31,7 @@ export function simpleBacktest(candles: Candle[], slPips = 20, rr = 2) {
     const f = fvgs.find(f => (bias === "BULL" ? f.side === "BULL" : f.side === "BEAR") && f.index > s.index);
     if (!f) continue;
     const entry = (f.high + f.low) / 2;
-    const sl = s.side === "BUY" ? entry - slPips * 0.0001 : entry + slPips * 0.0001;
+    const sl = s.side === "BUY" ? entry - pipToPrice((s as any).symbol ?? '', slPips) : entry + pipToPrice((s as any).symbol ?? '', slPips);
     const tp = s.side === "BUY" ? entry + (entry - sl) * rr : entry - (sl - entry) * rr;
 
     // simulate until hit TP/SL by scanning subsequent candles

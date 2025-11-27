@@ -23,7 +23,6 @@ export function triggerRetrainIfNeeded(samplesFilePath: string) {
     const modelOutput = path.join(projectRoot, AUTO_TRAINING_CONFIG.modelOutput || 'data/output/model.pkl');
 
     // spawn detached process so we don't block the bot
-    const outLog = path.join(projectRoot, 'data', 'output', `train_${Date.now()}.log`);
     const args = [trainScript, '--input', path.join(projectRoot, 'data', 'output', 'trade_signals.jsonl'), '--output', modelOutput];
 
     const child = spawn(pythonCmd, args, {
@@ -32,9 +31,8 @@ export function triggerRetrainIfNeeded(samplesFilePath: string) {
       stdio: ['ignore', 'ignore', 'ignore']
     });
 
-    // detach and let it run; write a short log file to record invocation
+    // detach and let it run in background (no logging needed)
     child.unref();
-    fs.appendFileSync(outLog, `${new Date().toISOString()} spawned trainer: ${pythonCmd} ${args.join(' ')}\n`);
   } catch (err) {
     // don't let training failures affect trading
     // eslint-disable-next-line no-console

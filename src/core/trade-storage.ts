@@ -26,6 +26,15 @@ export type TradeSignal = {
   fvgDistancePips?: number;
   slPips?: number;
   tpPips?: number;
+  // New fields: snapshot of features passed to the model and confirmation metadata
+  modelFeatures?: Record<string, any>;
+  confirmations?: {
+    count?: number;
+    list?: string[];
+    bos?: boolean;
+    liquidityGrab?: boolean;
+    third?: { type?: string; ok?: boolean };
+  };
   dynamicMaxDistance?: number;
   detectors?: Record<string, any>;
   status?: string; // 'signal'|'placed'|'closed' etc
@@ -240,6 +249,91 @@ export function readSignals(): TradeSignal[] {
       const { formatError } = require('../utils/error');
       console.warn('readSignals failed', formatError(err));
     return [];
+  }
+}
+
+/**
+ * Analyze recent closed signals to decide whether SLs around targetSlPips
+ * are frequently hit quickly (indicating a fragile SL pattern).
+ * Returns aggregate stats that strategy can use to decide whether to widen SL.
+ */
+export function analyzeSlHitPattern(symbol: string, side: 'BUY' | 'SELL', targetSlPips: number, opts?: { tolerancePercent?: number; lookback?: number; fastSecs?: number; minSample?: number }) {
+  try {
+    const tolerancePercent = opts?.tolerancePercent ?? 0.25; // +/- 25%
+    const lookback = opts?.lookback ?? 500;
+    const fastSecs = opts?.fastSecs ?? 60 * 60; // default 1hr
+    const minSample = opts?.minSample ?? 6;
+
+    const all = readSignals().filter(s => s.symbol && s.side && s.result && typeof s.result.closedTime === 'number' && typeof s.slPips === 'number');
+    // keep most recent first
+    const recent = all.reverse().filter(s => s.symbol.toUpperCase() === symbol.toUpperCase() && s.side === side).slice(0, lookback);
+    if (!recent || recent.length === 0) return { sampleCount: 0, fastHitCount: 0, fastHitRate: 0, avgCloseSeconds: 0 };
+
+    // matching sl distances within tolerance
+    const tol = Math.max(0.5, Math.abs(targetSlPips * tolerancePercent));
+    const matched = recent.filter(s => Math.abs((s.slPips ?? 0) - targetSlPips) <= tol);
+    const sampleCount = matched.length;
+    if (sampleCount < minSample) return { sampleCount, fastHitCount: 0, fastHitRate: 0, avgCloseSeconds: 0 };
+
+    const durations: number[] = [];
+    let fastHitCount = 0;
+    for (const s of matched) {
+      const start = s.time || 0;
+      const closed = (s.result && s.result.closedTime) || 0;
+      const dur = Math.max(0, closed - start);
+      durations.push(dur);
+      // consider a fast SL hit when closed quickly with loss
+      const profit = (s.result && typeof s.result.profit === 'number') ? (s.result.profit ?? 0) : 0;
+      if (profit <= 0 && dur <= fastSecs) fastHitCount++;
+    }
+
+    const avgCloseSeconds = durations.length ? Math.round(durations.reduce((a,b)=>a+b,0)/durations.length) : 0;
+    const fastHitRate = sampleCount ? (fastHitCount / sampleCount) : 0;
+
+    return { sampleCount, fastHitCount, fastHitRate, avgCloseSeconds };
+  } catch (err) {
+    return { sampleCount: 0, fastHitCount: 0, fastHitRate: 0, avgCloseSeconds: 0 };
+  }
+}
+
+/**
+ * Analyze recent entries (distance to edge/mid of FVG or distance-to-entry) to
+ * determine whether a particular entry distance tends to be hit (lose) quickly
+ * or performs well. Returns aggregated stats for strategy-driven entry refinement.
+ */
+export function analyzeEntryPattern(symbol: string, side: 'BUY' | 'SELL', entryDistancePips: number, opts?: { tolerancePercent?: number; lookback?: number; fastSecs?: number; minSample?: number }) {
+  try {
+    const tolerancePercent = opts?.tolerancePercent ?? 0.25; // +/- 25%
+    const lookback = opts?.lookback ?? 500;
+    const fastSecs = opts?.fastSecs ?? 60 * 60; // default 1hr
+    const minSample = opts?.minSample ?? 6;
+
+    const all = readSignals().filter(s => s.symbol && s.side && s.result && typeof s.result.closedTime === 'number' && typeof s.fvgDistancePips === 'number');
+    const recent = all.reverse().filter(s => s.symbol.toUpperCase() === symbol.toUpperCase() && s.side === side).slice(0, lookback);
+    if (!recent || recent.length === 0) return { sampleCount: 0, fastHitCount: 0, fastHitRate: 0, avgCloseSeconds: 0 };
+
+    const tol = Math.max(0.5, Math.abs(entryDistancePips * tolerancePercent));
+    const matched = recent.filter(s => Math.abs((s.fvgDistancePips ?? 0) - entryDistancePips) <= tol);
+    const sampleCount = matched.length;
+    if (sampleCount < minSample) return { sampleCount, fastHitCount: 0, fastHitRate: 0, avgCloseSeconds: 0 };
+
+    const durations: number[] = [];
+    let fastHitCount = 0;
+    for (const s of matched) {
+      const start = s.time || 0;
+      const closed = (s.result && s.result.closedTime) || 0;
+      const dur = Math.max(0, closed - start);
+      durations.push(dur);
+      const profit = (s.result && typeof s.result.profit === 'number') ? (s.result.profit ?? 0) : 0;
+      if (profit <= 0 && dur <= fastSecs) fastHitCount++;
+    }
+
+    const avgCloseSeconds = durations.length ? Math.round(durations.reduce((a,b)=>a+b,0)/durations.length) : 0;
+    const fastHitRate = sampleCount ? (fastHitCount / sampleCount) : 0;
+
+    return { sampleCount, fastHitCount, fastHitRate, avgCloseSeconds };
+  } catch (err) {
+    return { sampleCount: 0, fastHitCount: 0, fastHitRate: 0, avgCloseSeconds: 0 };
   }
 }
 

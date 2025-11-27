@@ -9,7 +9,7 @@ async function run() {
   const connector = new MT5Connector();
   const feed = new DataFeed(connector);
 
-  const SYMBOLS = ["GBPUSDz","EURUSDz","XAUUSDz","USDJPYz"];
+  const SYMBOLS = ["GBPUSDz","EURUSDz","XAUUSDz"];
   const timeframe = 'M5';
   const htfConfirm = 'M15';
 

@@ -30,6 +30,22 @@ export function sma(candles: Candle[], length: number): number {
   return sum / slice.length;
 }
 
+export function ema(candles: Candle[], length: number): number {
+  if (!candles || candles.length < length) return 0;
+  // seed EMA with SMA of the first `length` window
+  const slice = candles.slice(-length);
+  const smaSeed = slice.reduce((acc, c) => acc + c.close, 0) / slice.length;
+  const k = 2 / (length + 1);
+
+  // compute EMA iteratively over the most recent `length` candles (older -> newest)
+  let prev = smaSeed;
+  for (let i = 0; i < slice.length; i++) {
+    const price = slice[i].close;
+    prev = price * k + prev * (1 - k);
+  }
+  return prev;
+}
+
 export function lowest(candles: Candle[], lookback: number) {
   const slice = candles.slice(-lookback);
   return Math.min(...slice.map(c => c.low));

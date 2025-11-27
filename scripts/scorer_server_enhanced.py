@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Scoring server with winners-only model auto-reload.
-Loads model_winners.pkl and reloads it on each request to pick up retraining updates.
+Scoring server with losers-detector model auto-reload.
+Loads model_losers_detector.pkl and reloads it on each request to pick up retraining updates.
+Returns high lossProb (close to 1.0) for BAD patterns that lose money.
 """
 import argparse
 import joblib
@@ -133,7 +134,7 @@ def score():
         # Reload feature metadata at runtime if not loaded (helps after retraining)
         if feature_columns is None:
             try:
-                features_path = Path(__file__).parent.parent.joinpath('data', 'output', 'model_winners_features.json')
+                features_path = Path(__file__).parent.parent.joinpath('data', 'output', 'model_losers_features.json')
                 if features_path.exists():
                     with features_path.open('r', encoding='utf8') as fh:
                         obj = json.load(fh)
@@ -166,8 +167,8 @@ def health():
 
 def main():
     parser = argparse.ArgumentParser()
-    # Default to winners-only model for best accuracy
-    parser.add_argument('--model', default='data/output/model_winners.pkl')
+    # Default to losers-detector model to avoid bad patterns
+    parser.add_argument('--model', default='data/output/model_losers_detector.pkl')
     parser.add_argument('--port', type=int, default=5100)
     args = parser.parse_args()
 
@@ -176,9 +177,9 @@ def main():
     model = joblib.load(model_path)
     last_model_mtime = os.path.getmtime(model_path) if os.path.exists(model_path) else None
     
-    # Load feature metadata (use winners features by default)
+    # Load feature metadata (use losers detector features by default)
     try:
-        features_path = Path(model_path).parent.joinpath('model_winners_features.json')
+        features_path = Path(model_path).parent.joinpath('model_losers_features.json')
         if features_path.exists():
             with features_path.open('r', encoding='utf8') as fh:
                 obj = json.load(fh)

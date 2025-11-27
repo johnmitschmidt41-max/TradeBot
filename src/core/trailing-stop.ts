@@ -7,6 +7,7 @@
 import { MT5Connector } from './mt5-connector';
 import { info, warn } from '../utils/logger';
 import { STRATEGY_CONFIG } from '../config/strategy';
+import { pipToPrice } from '../utils/pip';
 
 export type TrailingStopMilestone = 'breakeven' | 'half-tp' | '3quarter-tp';
 
@@ -70,9 +71,11 @@ export class TrailingStopManager {
       }
 
       // Calculate new SL based on current price and trailing distance
+      // Convert trailing distance (in pips) to price using the pip utility so JPY/XAU are correct
+      const move = pipToPrice(symbol, trailingDist);
       const newSL = side === 'BUY'
-        ? currentPrice - (trailingDist * 0.0001) // Move SL up by trailing distance
-        : currentPrice + (trailingDist * 0.0001); // Move SL down by trailing distance
+        ? currentPrice - move // Move SL up by trailing distance
+        : currentPrice + move; // Move SL down by trailing distance
 
       // SAFETY: Never allow SL to move past entry price
       const safeNewSL = side === 'BUY'

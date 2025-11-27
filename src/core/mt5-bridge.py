@@ -10,7 +10,7 @@ import time
 app = Flask(__name__)
 CORS(app)
 
-ACCOUNT = 81531507
+ACCOUNT = 81538976
 PASSWORD = "underSTOOD224#"
 SERVER = "Exness-MT5Trial10"
 MT5_PATH = r"C:\Program Files\MetaTrader 5 EXNESS\terminal64.exe"

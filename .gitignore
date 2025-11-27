@@ -69,11 +69,17 @@ MQL5/Indicators/*.ex5
 # Output from strategies
 backtests/
 cache/
-data/
 
 # Generated JSON or session files
 *.session.json
 *.cache.json
+
+# Data folder - ignore generated files but keep directory structure
+data/output/*.jsonl
+data/output/*.pkl
+data/output/*.json
+data/trades.jsonl
+data/historical/
 
 # MT5 bridge files
 mt5-bridge/__pycache__/

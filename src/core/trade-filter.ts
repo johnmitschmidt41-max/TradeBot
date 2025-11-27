@@ -16,7 +16,7 @@ let startOfDayISO: string | null = null;
 let startEquity = 0;
 
 const DEFAULT_DAILY_DRAWDOWN = (STRATEGY_CONFIG.risk?.dailyDrawdownPercent) ?? 5;
-const DEFAULT_MAX_SIMULTANEOUS = (STRATEGY_CONFIG.risk?.maxSimultaneousTrades) ?? 3;
+const DEFAULT_MAX_SIMULTANEOUS = (STRATEGY_CONFIG.risk?.maxSimultaneousTrades)
 const DIRECTION_COOLDOWN_SECONDS = (STRATEGY_CONFIG.risk?.directionCooldownSeconds) ?? (5 * 60);
 
 function isoDateNow() {
@@ -115,19 +115,21 @@ export async function canOpenTrade(connector: MT5Connector, symbol: string, side
 
 export function logTrade(symbol: string, side: 'BUY' | 'SELL') {
   tradesLog.push({ symbol, side, time: nowSec() });
-  try {
-    persistTradeSignal({
-      time: nowSec(),
-      symbol,
-      side,
-      orderType: 'SIGNAL' as any,
-      entry: 0,
-      sl: 0,
-      tp: 0,
-      lots: 0,
-      status: 'signal'
-    });
-  } catch (e) {}
+    try {
+      persistTradeSignal({
+        time: nowSec(),
+        symbol,
+        side,
+        orderType: 'SIGNAL' as any,
+        entry: 0,
+        sl: 0,
+        tp: 0,
+        lots: 0,
+        status: 'signal',
+        confirmations: { count: 0 },
+        modelFeatures: {}
+      });
+    } catch (e) {}
 }
 
 export function getTradesTodayCount(symbol: string) {
