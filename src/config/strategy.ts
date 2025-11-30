@@ -43,7 +43,13 @@ export const STRATEGY_CONFIG = {
     defaultLeverage: 100,
     maxLots: 50,
     dailyDrawdownPercent: 300,
-    maxSimultaneousTrades: 4,
+    // Maximum simultaneous trades: 6 globally, max 2 per currency
+    maxSimultaneousTradesGlobal: 6,
+    maxSimultaneousTradesPerCurrency: {
+      GBPUSDz: 2,
+      EURUSDz: 2,
+      XAUUSDz: 2
+    },
     directionCooldownSeconds: 300,
     // Max 30 trades per day overall (cap to manage risk)
     maxTradesPerDay: 30,
@@ -58,18 +64,23 @@ export const STRATEGY_CONFIG = {
       XAUUSDz: 30
     },
     // Per-symbol SL caps: ensure SL distances stay within reasonable bounds
+    // CRITICAL: These are the MAXIMUM allowed SL distances
+    // If a setup requires a larger SL, reject it (enforce profitability)
     perSymbolCaps: {
       GBPUSDz: { minPips: 8, maxPips: 40 },
       EURUSDz: { minPips: 8, maxPips: 40 },
-      XAUUSDz: { minPips: 30, maxPips: 500 }
+      XAUUSDz: { minPips: 20, maxPips: 200 }
     }
   },
 
   tp: {
-    minRR: 1.5,
+    minRR: 2.0,
     // cap TP to avoid absurd RR (e.g. 50x). Set a maximum RR multiplier applied to SL.
     maxRR: 10,
     useTrailingStop: true,
+    // CRITICAL: Minimum profit must NEVER be less than 10% of balance (same as max loss)
+    // This ensures RR is always at least 1:1 (equal risk/reward)
+    minProfitPercent: 15
   },
 
   trailingStop: {
@@ -117,7 +128,7 @@ export const STRATEGY_CONFIG = {
     enabled: true,
     timeframes: ['M1', 'M3', 'M5'],  // All high-frequency timeframes
     htfConfirm: 'M15',
-    mlMaxLossProb: 0.55,
+    mlMaxLossProb: 0.75,
     m5ScalingFactor: 1.0,
     globalDailyCap: 30,
     // Per-currency daily cap: 30 trades max per currency per day
@@ -153,10 +164,11 @@ export const ML_CONFIG = {
   provider: 'gemini',
   apiUrlEnv: 'GEMINI_API_URL',
   apiKeyEnv: 'GEMINI_API_KEY',
-  gatingMode: 'strict',
-  // Threshold tuned for 2-signal gate: decline if loss prob > 55%
+  gatingMode: 'moderate',
+  // Threshold tuned for 2-signal gate: decline if loss prob > 75%
+  // Higher threshold reduces marginal trades and focuses on better setups
   // 4-signal setups skip this check entirely (auto-accept)
-  declineLossProb: 0.55
+  declineLossProb: 0.75
 };
 
 export const AUTO_TRAINING_CONFIG = {

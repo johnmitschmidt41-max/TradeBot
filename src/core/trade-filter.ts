@@ -15,9 +15,9 @@ const activePositions: Record<string, Set<'BUY' | 'SELL'>> = {};
 let startOfDayISO: string | null = null;
 let startEquity = 0;
 
-const DEFAULT_DAILY_DRAWDOWN = (STRATEGY_CONFIG.risk?.dailyDrawdownPercent) ?? 5;
-const DEFAULT_MAX_SIMULTANEOUS = (STRATEGY_CONFIG.risk?.maxSimultaneousTrades)
-const DIRECTION_COOLDOWN_SECONDS = (STRATEGY_CONFIG.risk?.directionCooldownSeconds) ?? (5 * 60);
+const DEFAULT_DAILY_DRAWDOWN = STRATEGY_CONFIG.risk.dailyDrawdownPercent;
+const DEFAULT_MAX_SIMULTANEOUS = STRATEGY_CONFIG.risk.maxSimultaneousTradesGlobal;
+const DIRECTION_COOLDOWN_SECONDS = STRATEGY_CONFIG.risk.directionCooldownSeconds;
 
 function isoDateNow() {
   return new Date().toISOString().slice(0, 10);

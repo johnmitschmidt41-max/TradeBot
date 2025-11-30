@@ -147,7 +147,7 @@ export class Strategy {
     return { found: foundFvg, confidence };
   }
 
-  private async checkThirdConfirmation(candles: Candle[], side: 'BUY'|'SELL', symbol: string): Promise<boolean> {
+  private async checkThirdConfirmation(candles: Candle[], side: 'BUY'|'SELL', symbol: string): Promise<{ ok: boolean; momentumScore?: number }> {
     // third confirmation choice per-symbol (EMA or MOMENTUM)
     const symbolKey = symbol; // keys use trailing 'z'
     const confThird = STRATEGY_CONFIG.confirmations.perSymbolThird as any;
@@ -160,27 +160,30 @@ export class Strategy {
         const ema50 = ema(candles, 50);
         const ema200 = ema(candles, 200);
         const last = candles[candles.length - 1].close;
-        if (ema9 === 0 || ema20 === 0 || ema50 === 0 || ema200 === 0) return false;
-        if (side === 'BUY') return ema9 > ema20 && ema20 > ema50 && last > ema200;
-        return ema9 < ema20 && ema20 < ema50 && last < ema200;
+        if (ema9 === 0 || ema20 === 0 || ema50 === 0 || ema200 === 0) return { ok: false };
+        const ok = side === 'BUY' ? (ema9 > ema20 && ema20 > ema50 && last > ema200) : (ema9 < ema20 && ema20 < ema50 && last < ema200);
+        // momentumScore: difference between short and medium EMAs (positive stronger for BUY)
+        const momentumScore = ema9 - ema20;
+        return { ok, momentumScore };
       } else {
         // MOMENTUM weakening — check MACD hist trend decreasing and volume declining
         // compute MACD-style histogram (EMA12-EMA26) now and 2 steps back
-        if (candles.length < 40) return false;
+        if (candles.length < 40) return { ok: false };
         const macdNow = ema(candles, 12) - ema(candles, 26);
         const macdPrev = ema(candles.slice(0, -1), 12) - ema(candles.slice(0, -1), 26);
         const macdPrev2 = ema(candles.slice(0, -2), 12) - ema(candles.slice(0, -2), 26);
         // for BUY: momentum weakening = hist decreasing (less positive), for SELL reverse
         const histWeakening = side === 'BUY' ? (macdNow < macdPrev && macdPrev < macdPrev2) : (macdNow > macdPrev && macdPrev > macdPrev2);
-        if (!histWeakening) return false;
+        if (!histWeakening) return { ok: false, momentumScore: macdNow - macdPrev };
         // check volume declining in recent bars
         const recentVol = candles.slice(-10).map(c => c.volume || 0);
         const avgVol = recentVol.reduce((a,b) => a + b, 0) / Math.max(1, recentVol.length);
         const lastVol = (candles[candles.length - 1].volume || 0);
-        return lastVol <= avgVol * 0.85; // volume has dropped at least 15%
+        const ok = lastVol <= avgVol * 0.85; // volume has dropped at least 15%
+        return { ok, momentumScore: macdNow - macdPrev };
       }
     } catch (e) {
-      return false;
+      return { ok: false };
     }
   }
 
@@ -229,8 +232,13 @@ export class Strategy {
     const candidate = this.pickNearestValidFVG(fvgs, currentPrice, symbol, dynamicMaxDistance);
     if (!candidate) return;
 
-    let entry = (currentPrice >= candidate.low && currentPrice <= candidate.high) ? currentPrice : (side === 'BUY' ? candidate.low : candidate.high);
-    const useMarketEntry = (entry === currentPrice);
+    // STRICT: only allow entry when price is actually inside the FVG zone (not near/close)
+    if (!(currentPrice >= candidate.low && currentPrice <= candidate.high)) {
+      info(`${timeframe} SKIPPED - price not currently inside FVG (${candidate.distancePips.toFixed(1)} pips)`);
+      return;
+    }
+    let entry = currentPrice;
+    const useMarketEntry = true;
 
     const pipSize = (symbol.includes('XAU') || symbol.includes('JPY')) ? 0.01 : 0.0001;
     // Use the exact symbol key (includes trailing 'z'), config keys use 'XAUUSDz', 'GBPUSDz' etc.
@@ -252,7 +260,35 @@ export class Strategy {
     }
     const liquidityBuffer = configuredBufferPipsHF * pipSize;
     info(`${timeframe} using sweep SL buffer ${configuredBufferPipsHF} pips (${liquidityBuffer.toFixed(4)} price) for ${symbol}; sweepExtreme=${sweepExtreme.toFixed(symbol.includes('XAU') ? 2 : 5)}`);
+    // CRITICAL FIX: SL must be on OPPOSITE side of entry
+    // BUY: entry goes UP, SL goes BELOW entry (closer to sweep low)
+    // SELL: entry goes DOWN, SL goes ABOVE entry (closer to sweep high)
+    // sweepExtreme is the wick extreme where liquidity was hunted
+    // We place SL slightly BEYOND the sweep to protect against wicks
+    // CRITICAL: Get minPips requirement FIRST from config
+    const slCapsConfigEarly = STRATEGY_CONFIG.sl.perSymbolCaps as any;
+    const capsEarly = slCapsConfigEarly[symbolKey] || {};
+    // Use explicit per-symbol minPips from config if set, otherwise fall back to pipsBelowSweep
+    const minPipsRequired = (typeof capsEarly.minPips === 'number') ? capsEarly.minPips : configuredBufferPipsHF;
+    
+    // Calculate initial SL from sweep (SL should be beyond the sweep extreme)
+    // For BUY trades, opposite SELL sweepExtreme is a low -> SL must be below it
+    // For SELL trades, opposite BUY sweepExtreme is a high -> SL must be above it
     let sl = side === 'BUY' ? sweepExtreme - liquidityBuffer : sweepExtreme + liquidityBuffer;
+    
+    // ENFORCE: SL must be at least minPips away from entry
+    let slDistance = priceToPip(symbol, Math.abs(entry - sl));
+    if (slDistance < minPipsRequired) {
+      if (symbol.includes('XAU')) {
+        modelDecision('❌ M5 REJECTED - SL too tight for XAU (below minPips)', { symbol, side, slDistance, requiredMin: minPipsRequired });
+        return; // reject XAU candidate
+      } else {
+        // For non-XAU symbols, widen SL to minPips rather than rejecting
+        modelDecision('🔧 M5 SL ADJUSTED - widened to min cap (non-XAU)', { symbol, side, oldSl: slDistance, newSl: minPipsRequired });
+        slDistance = minPipsRequired;
+        sl = side === 'BUY' ? entry - (slDistance * pipSize) : entry + (slDistance * pipSize);
+      }
+    }
     
     // --- Enforce 2-signal minimum: MANDATORY = Liquidity Grab + FVG/Displacement
     // BONUS = BOS + Third Confirmation (if present, increases confidence but not required)
@@ -284,7 +320,14 @@ export class Strategy {
       
       // BONUS signals (optional, increase confidence if present)
       const bos = this.isStructureBreak(candles, side);
-      const thirdOk = await this.checkThirdConfirmation(candles, side, symbolKey);
+      const thirdRes = await this.checkThirdConfirmation(candles, side, symbolKey);
+      const thirdOk = !!(thirdRes && thirdRes.ok);
+      // Require at least one confluence (BOS OR third/momentum) before placing this high-frequency trade
+      if (!bos && !thirdOk) {
+        modelDecision(`${timeframe} SKIPPED - no confluence (BOS or momentum)`, { symbol, side, bos, thirdOk });
+        return;
+      }
+      const thirdMomentum = thirdRes?.momentumScore ?? 0;
       
       if (bos) {
         bosConfidence = 0.5;
@@ -310,23 +353,26 @@ export class Strategy {
       info(`M5 missing slTp.perSymbol config for ${symbolKey} — skipping`);
       return;
     }
-    let slDistance = priceToPip(symbol, Math.abs(entry - sl));
+
+    // Get account balance FIRST (needed for profit calculations)
+    const accountInfo = await this.connector.getAccountInfo();
+    const accountBalance = accountInfo?.balance || 100;
+
+    // slDistance already calculated above when enforcing minPips
+    slDistance = priceToPip(symbol, Math.abs(entry - sl));
     // Use FIXED TP from config, not derived from SL distance (prevents runaway TP)
     let tpDistancePips = slTpConfig.tpPips;
     let tp = side === 'BUY' ? entry + (tpDistancePips * pipSize) : entry - (tpDistancePips * pipSize);
-    // enforce per-symbol min/max SL caps (don't silently fall back if there's no sweep)
+    
+    // enforce per-symbol max SL cap only (min already enforced above)
+    // Precompute minProfitUSD (we need it after sizing) so it's in-scope
+    const minProfitPercent = (STRATEGY_CONFIG.tp as any).minProfitPercent || 10;
+    const minProfitUSD = (accountBalance * minProfitPercent) / 100;
+
     try {
       const slCapsConfig = STRATEGY_CONFIG.sl.perSymbolCaps as any;
       const caps = slCapsConfig[symbolKey] || {};
-      const minCap = Math.max(configuredBufferPipsHF, (caps.minPips || configuredBufferPipsHF));
       const maxCap = caps.maxPips || Number.POSITIVE_INFINITY;
-
-      if (slDistance < minCap) {
-        // widen SL to minimum cap rather than skipping entirely
-        modelDecision('🔧 M5 SL ADJUSTED - widened to min cap', { symbol, side, oldSl: slDistance, newSl: minCap });
-        slDistance = minCap;
-        sl = side === 'BUY' ? entry - (slDistance * pipSize) : entry + (slDistance * pipSize);
-      }
 
       if (slDistance > maxCap) {
         // cap excessive SLs so we don't produce runaway SLs
@@ -341,17 +387,40 @@ export class Strategy {
       tpDistancePips = Math.max(slTpConfig.tpPips, slDistance * minRR);
       tpDistancePips = Math.min(tpDistancePips, slDistance * maxRR);
       tp = side === 'BUY' ? entry + (tpDistancePips * pipSize) : entry - (tpDistancePips * pipSize);
+
+      // Reject if SL is not smaller than TP (invalid / poor RR)
+      if (slDistance >= tpDistancePips) {
+        modelDecision('❌ M5 REJECTED - SL >= TP (bad RR)', { symbol, side, slDistance, tpDistance: tpDistancePips });
+        return;
+      }
+      
+      // CRITICAL: Enforce minimum profit (USD target) based on account balance
+      // We'll convert the USD target to pips after computing lots (pip USD depends on lots)
+      const minProfitPercent = (STRATEGY_CONFIG.tp as any).minProfitPercent || 10;
+      const minProfitUSD = (accountBalance * minProfitPercent) / 100;
     } catch (e:any) {
       // if caps lookup fails, continue using calculated distances
     }
 
-    const accountInfo = await this.connector.getAccountInfo();
-    const accountBalance = accountInfo?.balance || 100;
     let lots = computeVolume(accountBalance, STRATEGY_CONFIG.risk.riskPercent, slDistance, symbol);
     const scalingFactor = STRATEGY_CONFIG.risk.scalingFactor || 1;
     const m5ScalingFactor = STRATEGY_CONFIG.highFrequency.m5ScalingFactor || 0.3;
     lots = Math.round((lots * scalingFactor * m5ScalingFactor) * 100) / 100;
     if (lots < 0.01) return;
+
+    // Enforce minimum USD profit requirement using real pip value and lots
+    try {
+      const pipUsdPerLot = pipValuePerLot(symbol); // USD per pip per 1 lot
+      const usdPerPipForTrade = Math.max(0.0000001, pipUsdPerLot * lots);
+      const minProfitPips = Math.ceil(minProfitUSD / usdPerPipForTrade);
+      if (tpDistancePips < minProfitPips) {
+        modelDecision('🔧 M5 TP INCREASED - enforcing min USD profit', { symbol, side, oldTpDistance: tpDistancePips, newTpDistance: minProfitPips, minProfitUSD: minProfitUSD.toFixed(2) });
+        tpDistancePips = minProfitPips;
+        tp = side === 'BUY' ? entry + (tpDistancePips * pipSize) : entry - (tpDistancePips * pipSize);
+      }
+    } catch (e) {
+      // ignore pip value errors, keep previous TP
+    }
 
     if (ML_CONFIG?.enabled) {
       try {
@@ -392,6 +461,11 @@ export class Strategy {
               if (closerScore && typeof closerScore.lossProb === 'number' && closerScore.lossProb <= thr) {
                 modelDecision('🔧 M5 ENTRY REFINED - closerEntry accepted', { symbol, side, oldEntry: entry, newEntry: closerEntry, oldLoss: score.lossProb, newLoss: closerScore.lossProb });
                 entry = closerEntry; slDistance = closerSlDistance; tp = closerTp; tpDistancePips = closerTpDistance;
+                // ensure SL still honors the per-symbol minimum distance after entry shift
+                if (slDistance < minPipsRequired) {
+                  slDistance = minPipsRequired;
+                  sl = side === 'BUY' ? entry - (slDistance * pipSize) : entry + (slDistance * pipSize);
+                }
               } else if (typeof candidate?.mid === 'number') {
                 const midEntry = candidate.mid;
                 const midSlDistance = priceToPip(symbol, Math.abs(midEntry - sl));
@@ -407,6 +481,11 @@ export class Strategy {
                 if (midScore && typeof midScore.lossProb === 'number' && midScore.lossProb <= thr) {
                   modelDecision('🔧 M5 ENTRY REFINED - midEntry accepted', { symbol, side, oldEntry: entry, newEntry: midEntry, oldLoss: score.lossProb, newLoss: midScore.lossProb });
                   entry = midEntry; slDistance = midSlDistance; tp = midTp; tpDistancePips = midTpDistance;
+                  // enforce min distance after mid entry shift
+                  if (slDistance < minPipsRequired) {
+                    slDistance = minPipsRequired;
+                    sl = side === 'BUY' ? entry - (slDistance * pipSize) : entry + (slDistance * pipSize);
+                  }
                 }
               }
             } catch (e:any) {
@@ -500,19 +579,21 @@ export class Strategy {
           const liqu = this.isLiquidityGrab(recentSweeps, side, sweepThreshold);
           const perSymbolThird = confCfg.perSymbolThird as any;
           const thirdType = (perSymbolThird && perSymbolThird[symbol]) || 'EMA';
-          const thirdOk = await this.checkThirdConfirmation(candles, side, symbol);
+          const thirdRes = await this.checkThirdConfirmation(candles, side, symbol);
+          const thirdOk = !!(thirdRes && thirdRes.ok);
+          const thirdMomentum = thirdRes?.momentumScore ?? 0;
           confirmations.count = (bos ? 1 : 0) + (liqu ? 1 : 0) + (thirdOk ? 1 : 0);
           confirmations.list = [];
           if (bos) { confirmations.list.push('BOS'); confirmations.bos = true; }
           if (liqu) { confirmations.list.push('LIQUIDITY_GRAB'); confirmations.liquidityGrab = true; }
-          confirmations.third = { type: thirdType, ok: thirdOk };
+          confirmations.third = { type: thirdType, ok: thirdOk, momentum: thirdMomentum };
         }
       } catch (e) {}
 
       cid = persistTradeSignalWithCid({ time: Math.floor(Date.now()/1000), symbol, side, orderType: 'MARKET', entry: +entry, price: +entry, sl: +sl, tp: +tp, lots, status: 'placed', modelFeatures, confirmations });
     } catch (e) {}
 
-    // Trade approved by 2-signal system (Liquidity + FVG). Logging removed to avoid confusion.
+    // Trade approved by 2-signal system (Liquidity + FVG).
 
     // Round SL/TP to proper decimal places (JPY pairs=2, others=5)
     const decimalPlaces = symbol.includes('JPY') ? 2 : 5;
@@ -781,66 +862,48 @@ export class Strategy {
         const fvgMid = candidate.mid;
 
         const distanceToFVG = candidate.distancePips;
-        const insideTolerancePips = 3;
-        const insideTolerancePrice = insideTolerancePips * pipSize;
 
         let entry: number;
         let useMarketOrder = false;
 
-        if (currentPrice >= fvgLow - insideTolerancePrice && currentPrice <= fvgHigh + insideTolerancePrice) {
-          info(`✅ Price INSIDE or very near FVG (${distanceToFVG.toFixed(1)} pips). Using MARKET order.`);
+        // STRICT: only accept price when it is strictly inside the FVG zone (not near it)
+        if (currentPrice >= fvgLow && currentPrice <= fvgHigh) {
+          info(`✅ Price INSIDE FVG (${distanceToFVG.toFixed(1)} pips). Using MARKET order.`);
           entry = currentPrice;
           useMarketOrder = true;
         } else {
-          // Check if FVG is in the right direction for a limit order
-          if (bias === 'BULL') {
-            // For BUY: FVG low should be below current price for a valid limit
-            if (fvgLow >= currentPrice) {
-              // FVG is above price - switch to MARKET order at current price
-              entry = currentPrice;
-              useMarketOrder = true;
-            } else {
-              entry = fvgLow;
-            }
-          } else {
-            // For SELL: FVG high should be above current price for a valid limit
-            if (fvgHigh <= currentPrice) {
-              // FVG is below price - switch to MARKET order at current price
-              entry = currentPrice;
-              useMarketOrder = true;
-            } else {
-              entry = fvgHigh;
-            }
-          }
-
-          if (!useMarketOrder) {
-            const distanceToEntry = priceToPip(symbol, Math.abs(entry - currentPrice));
-
-            if (distanceToEntry > dynamicMaxDistance) {
-              info(`🕐 Nearest FVG too far (${distanceToEntry.toFixed(1)} pips, limit ${dynamicMaxDistance}). Waiting.`);
-              continue;
-            }
-
-            info(`📍 Nearest FVG ${distanceToEntry.toFixed(1)} pips away. Placing LIMIT order.`);
-          }
+          info(`⛔ Price not on FVG (distance ${distanceToFVG.toFixed(1)} pips) — skipping ${symbol}`);
+          continue;
         }
+        
 
           // Use the exact symbol key (config now uses keys with trailing 'z')
           const symbolKey = symbol;
 
-        // --- Enforce 3-confirmation rule if configured
+        // Evaluate optional confirmations and require at least one confluence (BOS or third confirmation/momentum)
         const conf = STRATEGY_CONFIG.confirmations;
+        // compute confluence signals (BOS and third/momentum)
+        const bos = this.isStructureBreak(candles, side);
+        const sweepThreshold = STRATEGY_CONFIG.sweep.thresholdPips || 10;
+        const liqu = this.isLiquidityGrab(recentSweeps, side, sweepThreshold);
+        const thirdRes2 = await this.checkThirdConfirmation(candles, side, symbolKey);
+        const thirdOk2 = !!(thirdRes2 && thirdRes2.ok);
+        const thirdMomentum2 = thirdRes2?.momentumScore ?? 0;
+
+        // Require at least one confluence (BOS OR third confirmation/momentum) before placing any order
+        if (!bos && !thirdOk2) {
+          modelDecision('⛔ M15 SKIPPED - no confluence (BOS or momentum) present', { symbol, side, bos, thirdOk: thirdOk2, momentum: thirdMomentum2 });
+          continue;
+        }
+
+        // --- Enforce 3-confirmation rule if explicitly configured to require 3
         if (conf && (conf.minimumConfirmations || 0) >= 3) {
-          const bos = this.isStructureBreak(candles, side);
-          const sweepThreshold = STRATEGY_CONFIG.sweep.thresholdPips || 10;
-          const liqu = this.isLiquidityGrab(recentSweeps, side, sweepThreshold);
-          const thirdOk = await this.checkThirdConfirmation(candles, side, symbolKey);
-          if (!bos || !liqu || !thirdOk) {
-            modelDecision('⛔ M15 SKIPPED - failing confirmations', { symbol, side, bos, liquidityGrab: liqu, thirdOk });
+          if (!bos || !liqu || !thirdOk2) {
+            modelDecision('⛔ M15 SKIPPED - failing confirmations (3-signal required)', { symbol, side, bos, liquidityGrab: liqu, thirdOk: thirdOk2 });
             continue;
           }
           // ✅ All confirmations passed - log the passing state for transparency
-          modelDecision('✅ M15 CONFIRMATIONS PASS - proceeding', { symbol, side, bos, liquidityGrab: liqu, thirdOk });
+          modelDecision('✅ M15 CONFIRMATIONS PASS - proceeding', { symbol, side, bos, liquidityGrab: liqu, thirdOk: thirdOk2, momentum: thirdMomentum2 });
         }
         const slTpPerSymbol = STRATEGY_CONFIG.slTp.perSymbol as any;
         const slTpConfig = slTpPerSymbol[symbolKey];
@@ -898,13 +961,21 @@ export class Strategy {
         try {
           const slCapsConfig = STRATEGY_CONFIG.sl.perSymbolCaps as any;
           const caps = slCapsConfig[symbolKey] || {};
-          const minCap = Math.max(configuredBufferPips, (caps.minPips || configuredBufferPips));
+          // prefer the explicit configured minimum (caps.minPips). If not set, use the sweep buffer.
+          const minCap = (typeof caps.minPips === 'number') ? caps.minPips : configuredBufferPips;
           const maxCap = caps.maxPips || Number.POSITIVE_INFINITY;
 
           if (slDistance < minCap) {
-            modelDecision('🔧 M15 SL ADJUSTED - widened to min cap', { symbol, side, oldSl: slDistance, newSl: minCap });
-            slDistance = minCap;
-            slPrice = side === 'BUY' ? entry - (slDistance * pipSize) : entry + (slDistance * pipSize);
+            if (symbol.includes('XAU')) {
+              modelDecision('❌ M15 REJECTED - SL too tight; below minPips (XAU)', { symbol, side, slDistance, requiredMin: minCap });
+              // SL is too tight for XAU — reject the trade
+              continue;
+            } else {
+              // For non-XAU, widen to minimum cap rather than rejecting
+              modelDecision('🔧 M15 SL ADJUSTED - widened to min cap (non-XAU)', { symbol, side, oldSl: slDistance, newSl: minCap });
+              slDistance = minCap;
+              slPrice = side === 'BUY' ? entry - (slDistance * pipSize) : entry + (slDistance * pipSize);
+            }
           }
 
           if (slDistance > maxCap) {
@@ -920,6 +991,11 @@ export class Strategy {
           const cappedTp = Math.min(computedTp, slDistance * maxRRVal);
           tpDistance = cappedTp;
           tpPrice = side === 'BUY' ? entry + (tpDistance * pipSize) : entry - (tpDistance * pipSize);
+          // Reject trade if SL is not smaller than TP (bad setup)
+          if (slDistance >= tpDistance) {
+            modelDecision('❌ M15 REJECTED - SL >= TP (bad RR)', { symbol, side, slDistance, tpDistance });
+            continue;
+          }
         } catch (e) {
           // if caps lookup fails use the previously calculated values
         }
@@ -987,6 +1063,22 @@ export class Strategy {
         if (lots < 0.01) {
           warn(`Cannot meet risk target: computed lots < 0.01 (maxByRisk=${maxLotsByRisk}, maxByMargin=${maxLotsByMargin}). Skipping.`);
           continue;
+        }
+
+        // Enforce minimum USD profit requirement using accurate pip value per lot
+        try {
+          const minProfitPercentCfg = (STRATEGY_CONFIG.tp as any).minProfitPercent || 10;
+          const minProfitUSD = (accountBalance * minProfitPercentCfg) / 100;
+          const pipUsdPerLot = pipValuePerLot(symbol);
+          const usdPerPipForTrade = Math.max(0.0000001, pipUsdPerLot * lots);
+          const minProfitPips = Math.ceil(minProfitUSD / usdPerPipForTrade);
+          if (tpDistance < minProfitPips) {
+            modelDecision('🔧 M15 TP INCREASED - enforcing min USD profit', { symbol, side, oldTpDistance: tpDistance, newTpDistance: minProfitPips, minProfitUSD: minProfitUSD.toFixed(2) });
+            tpDistance = minProfitPips;
+            tpPrice = side === 'BUY' ? entry + (tpDistance * pipSize) : entry - (tpDistance * pipSize);
+          }
+        } catch (e) {
+          // ignore if pip conversion errors
         }
 
         // global cap from config (safety)

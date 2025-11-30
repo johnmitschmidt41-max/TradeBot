@@ -9,13 +9,17 @@ export class OrderManager {
   async placeLimitOrder(req: OrderRequest) {
     try {
       info('Placing LIMIT order', req);
+      // SL and TP must be provided for limit orders
+      if (typeof req.sl !== 'number' || typeof req.tp !== 'number') {
+        throw new Error('SL and TP are required for limit orders');
+      }
       const res = await this.connector.placeOrder({
         symbol: req.symbol,
         type: req.type,
         volume: req.volume,
         price: req.price,
-        sl: req.sl ?? 0,
-        tp: req.tp ?? 0,
+        sl: req.sl,
+        tp: req.tp,
         comment: req.comment
       });
       info('Order result', res);
@@ -39,13 +43,17 @@ export class OrderManager {
   }) {
     try {
       info('Placing MARKET order', req);
+      // Validate SL and TP are actual numbers (not NaN or undefined)
+      if (!isFinite(req.sl) || !isFinite(req.tp)) {
+        throw new Error(`Invalid SL or TP: sl=${req.sl}, tp=${req.tp}`);
+      }
       const res = await this.connector.placeOrder({
         symbol: req.symbol,
         type: req.type,
         volume: req.volume,
         price: 0, // 0 = market order
-        sl: req.sl ?? 0,
-        tp: req.tp ?? 0,
+        sl: req.sl,
+        tp: req.tp,
         comment: req.comment
       });
       info('Order result', res);

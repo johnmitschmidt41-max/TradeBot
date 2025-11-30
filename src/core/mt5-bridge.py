@@ -6,16 +6,113 @@ from datetime import datetime, timedelta
 from flask_cors import CORS
 import sys
 import time
+import json
+import os
+import threading
 
 app = Flask(__name__)
 CORS(app)
 
-ACCOUNT = 81538976
-PASSWORD = "underSTOOD224#"
-SERVER = "Exness-MT5Trial10"
-MT5_PATH = r"C:\Program Files\MetaTrader 5 EXNESS\terminal64.exe"
+# Load configuration
+CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.json")
+
+def load_config():
+    """Load account configuration from config.json"""
+    if not os.path.exists(CONFIG_PATH):
+        print(f"❌ Config file not found at {CONFIG_PATH}")
+        return None
+    
+    try:
+        with open(CONFIG_PATH, 'r') as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"❌ Failed to load config: {e}")
+        return None
+
+def get_current_mode():
+    """Get current trading mode from trading_mode.json"""
+    mode_file = os.path.join(os.path.dirname(__file__), "..", "..", "data", "config", "trading_mode.json")
+    if os.path.exists(mode_file):
+        try:
+            with open(mode_file, 'r') as f:
+                mode_data = json.load(f)
+                return mode_data.get("mode", "DEMO")
+        except Exception:
+            return "DEMO"
+    return "DEMO"
+
+config = load_config()
+if not config:
+    print("❌ Failed to load configuration, exiting")
+    sys.exit(1)
+
+# Get current mode
+CURRENT_MODE = get_current_mode()
+print(f"📋 Current trading mode: {CURRENT_MODE}")
+
+# Load account info based on current mode
+account_config = config["accounts"].get(CURRENT_MODE)
+if not account_config:
+    print(f"❌ Account configuration not found for mode: {CURRENT_MODE}")
+    sys.exit(1)
+
+ACCOUNT = account_config["accountNumber"]
+PASSWORD = account_config["password"]
+SERVER = account_config["server"]
+MT5_PATH = config.get("mt5Path", r"C:\Program Files\MetaTrader 5 EXNESS\terminal64.exe")
+
+print(f"🔐 Logging in to {CURRENT_MODE} account: {ACCOUNT} @ {SERVER}")
 
 mt5_initialized = False
+last_known_mode = CURRENT_MODE  # Track mode changes
+
+
+def check_mode_change():
+    """Check if trading mode has changed and reconnect if needed"""
+    global CURRENT_MODE, ACCOUNT, PASSWORD, SERVER, last_known_mode, mt5_initialized
+    
+    new_mode = get_current_mode()
+    if new_mode != last_known_mode:
+        print(f"\n{'='*60}")
+        print(f"🔄 MODE CHANGE DETECTED: {last_known_mode} → {new_mode}")
+        print(f"{'='*60}")
+        last_known_mode = new_mode
+        
+        # Reload account config for new mode
+        account_config = config["accounts"].get(new_mode)
+        if not account_config:
+            print(f"❌ Account config not found for {new_mode}")
+            return False
+        
+        CURRENT_MODE = new_mode
+        ACCOUNT = account_config["accountNumber"]
+        PASSWORD = account_config["password"]
+        SERVER = account_config["server"]
+        
+        print(f"📋 Current trading mode: {CURRENT_MODE}")
+        print(f"🔐 Logging in to {CURRENT_MODE} account: {ACCOUNT} @ {SERVER}")
+        
+        # Disconnect and reconnect
+        if mt5_initialized:
+            try:
+                mt5.shutdown()
+                mt5_initialized = False
+                print("✅ Disconnected from previous account")
+                time.sleep(1)
+            except Exception as e:
+                print(f"⚠️  Error disconnecting: {e}")
+        
+        # Reconnect to new account
+        if init_mt5():
+            print(f"✅ Connected to {CURRENT_MODE} account: {ACCOUNT}")
+            print(f"{'='*60}\n")
+            return True
+        else:
+            print(f"❌ Failed to connect to {CURRENT_MODE} account")
+            print(f"{'='*60}\n")
+            return False
+    
+    return True
 
 
 def init_mt5():
@@ -49,8 +146,14 @@ for i in range(5):
 
 @app.route('/health', methods=['GET'])
 def health():
+    # Check for mode changes on every health check
+    check_mode_change()
+    
     return jsonify({
         "status": "connected" if mt5_initialized else "disconnected",
+        "trading_mode": CURRENT_MODE,
+        "account": ACCOUNT,
+        "server": SERVER,
         "terminal_info": mt5.terminal_info()._asdict() if mt5_initialized else None
     })
 
@@ -304,6 +407,31 @@ def get_deals():
         return jsonify({"deals": []}), 500
 
 
+def background_mode_checker():
+    """Background thread that checks for mode changes every 5 seconds"""
+    global last_known_mode
+    check_count = 0
+    while True:
+        try:
+            time.sleep(5)
+            check_count += 1
+            
+            new_mode = get_current_mode()
+            # Always call check_mode_change to let it handle the comparison
+            check_mode_change()
+            
+            # Log periodic checks every 10 checks (50 seconds) to show it's alive
+            if check_count % 10 == 0:
+                print(f"✅ Mode check #{check_count}: {CURRENT_MODE} account {ACCOUNT} @ {SERVER}")
+        except Exception as e:
+            print(f"⚠️  Mode checker error: {e}")
+
+
 if __name__ == "__main__":
     print("Starting MT5 Bridge on http://localhost:5000")
+    
+    # Start background mode checker thread
+    mode_checker_thread = threading.Thread(target=background_mode_checker, daemon=True)
+    mode_checker_thread.start()
+    print("✅ Background mode checker started")
     app.run(host="0.0.0.0", port=5000)

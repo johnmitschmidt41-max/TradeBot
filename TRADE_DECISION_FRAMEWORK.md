@@ -267,9 +267,9 @@ Result: 0.62 > 0.55 → REJECT
 |-----------|-------|
 | Risk per Trade | 10% of account |
 | Max Lots | 50 |
-| Max Simultaneous | 4 trades |
+| Max Simultaneous (Global) | 6 trades |
+| Max per Currency | 2 trades |
 | Max per Day/Currency | 30 trades |
-| Global Daily Cap | 30 trades |
 
 ### ML Gating
 
@@ -645,6 +645,224 @@ if loss_probability > 0.55
    ├─ 0.575 > 0.55 ✗
    └─ REJECT ⛔
 ```
+
+---
+
+## Demo/Real Mode & Auto-Switch Logic
+
+### Overview
+
+Bot runs in two modes with automatic protection:
+- **DEMO Mode**: Paper trading (no real money at risk)
+- **REAL Mode**: Live trading (real account)
+
+**Auto-Switch Rule:** After 3 consecutive losses on REAL → switch to DEMO
+**Auto-Restore:** Daily restart at 03:00 UTC+1 → restore REAL mode
+
+---
+
+### Mode Management
+
+#### **Starting Bot**
+```
+Bot starts → Loads mode config → Defaults to DEMO (safe)
+```
+
+#### **During Trading Day (REAL Mode)**
+```
+Trade 1: LOSS        → Count: 1/3
+Trade 2: LOSS        → Count: 2/3 (warning logged)
+Trade 3: LOSS        → Count: 3/3 THRESHOLD HIT!
+         
+AUTO ACTION:
+├─ Switch to DEMO mode
+├─ Disconnect from REAL account
+├─ Reconnect to DEMO account
+├─ Reset loss counter to 0
+└─ Log: "🔄 AUTO-SWITCHED to DEMO after 3 consecutive losses"
+
+Remaining day: Trading on DEMO only (learning/testing)
+```
+
+**Loss Counter Reset:**
+- **After a WIN**: Counter resets to 0 (breaks the streak)
+- **At Daily Restart**: Counter resets regardless of status
+
+---
+
+#### **Daily Restart (03:00 UTC+1)**
+```
+Bot wakes up → Checks mode state
+
+If DEMO (from 3-loss trigger):
+├─ Auto-restore to REAL mode
+├─ Reset loss counter to 0
+├─ Reconnect to REAL account
+└─ Ready to trade again
+
+If already REAL:
+└─ Continue on REAL (normal operation)
+```
+
+---
+
+### Command Usage
+
+**Check current mode:**
+```bash
+python scripts/switch_mode.py --status
+```
+
+**Output:**
+```
+╔═══════════════════════════════════════════╗
+║         TRADING MODE STATUS               ║
+╠═══════════════════════════════════════════╣
+║ Current Mode:        REAL                 ║
+║ Last Switched:       2025-11-28T10:30:00  ║
+║ Reason:              daily_restart        ║
+║ Mode Locked:         No                   ║
+║ Consecutive Losses:  1/3                  ║
+╚═══════════════════════════════════════════╝
+```
+
+**Switch to REAL (with confirmation):**
+```bash
+python scripts/switch_mode.py --mode real
+```
+
+**Switch to DEMO:**
+```bash
+python scripts/switch_mode.py --mode demo
+```
+
+**Verbose status (with recent logs):**
+```bash
+python scripts/switch_mode.py --status --verbose
+```
+
+---
+
+### Mode State File
+
+**Location:** `data/config/trading_mode.json`
+
+```json
+{
+  "mode": "REAL",
+  "lastSwitched": "2025-11-28T03:00:00Z",
+  "reason": "daily_restart",
+  "consecutiveLosses": {
+    "count": 1,
+    "startedAt": "2025-11-28T10:30:00Z",
+    "trades": [
+      {
+        "orderId": "order_123",
+        "profit": -50.00,
+        "timestamp": "2025-11-28T10:30:00Z"
+      }
+    ]
+  },
+  "autoRules": {
+    "enabled": true,
+    "lossThreshold": 3,
+    "demoLearningMode": false,
+    "restoreAtDailyRestart": true
+  }
+}
+```
+
+---
+
+### Position Limits
+
+**Global:** Max 6 simultaneous trades across all currencies
+**Per Currency:** Max 2 simultaneous trades per symbol
+
+Example scenario:
+```
+GBPUSDz: 2 open trades (at limit)
+EURUSDz: 2 open trades (at limit)
+XAUUSDz: 2 open trades (at limit)
+─────────────────────────
+TOTAL:   6 open trades (global limit reached)
+
+New signal on GBPUSDz → BLOCKED (both GBP and global limits hit)
+```
+
+**Position Status:**
+```
+GBP: 2/2 | EUR: 1/2 | XAU: 1/2 | Total: 4/6
+```
+
+---
+
+### Loss Counter Logic
+
+**Consecutive Loss Tracking (REAL Mode Only):**
+
+IMPORTANT: Losses must be **CONSECUTIVE** - any WIN breaks the streak back to 0!
+
+**Examples:**
+
+1. **Consecutive Losses (TRIGGER AT 3)**
+   ```
+   Trade 1: LOSS      → Counter: 1/3
+   Trade 2: LOSS      → Counter: 2/3
+   Trade 3: LOSS      → Counter: 3/3 → AUTO-SWITCH to DEMO ⛔
+   ```
+
+2. **Win Breaks the Streak (Counter Resets)**
+   ```
+   Trade 1: LOSS      → Counter: 1/3
+   Trade 2: WIN       → Counter: 0/3 (RESET - win breaks streak)
+   Trade 3: LOSS      → Counter: 1/3 (start over)
+   ```
+
+3. **Win After 2 Losses (Does NOT Switch)**
+   ```
+   Trade 1: LOSS      → Counter: 1/3
+   Trade 2: LOSS      → Counter: 2/3
+   Trade 3: WIN       → Counter: 0/3 (breaks streak, no switch)
+   Trade 4: LOSS      → Counter: 1/3 (start fresh)
+   ```
+
+4. **4 Losses with Win in Middle (No Switch)**
+   ```
+   Trade 1: LOSS      → Counter: 1/3
+   Trade 2: LOSS      → Counter: 2/3
+   Trade 3: WIN       → Counter: 0/3 (resets)
+   Trade 4: LOSS      → Counter: 1/3 (new sequence)
+   Trade 5: LOSS      → Counter: 2/3
+   Trade 6: LOSS      → Counter: 3/3 → AUTO-SWITCH to DEMO ⛔
+   ```
+
+5. **Perfect Consecutive (Immediate Trigger)**
+   ```
+   Trade 1: LOSS      → Counter: 1/3
+   Trade 2: LOSS      → Counter: 2/3 (⚠️ Warning logged)
+   Trade 3: LOSS      → Counter: 3/3 → 🔄 AUTO-SWITCH to DEMO
+   ```
+
+**Key Rules:**
+- ✅ **WIN** = Streak broken, counter reset to 0
+- ❌ **3 CONSECUTIVE LOSSES** = Auto-switch to DEMO
+- ⏸️ **Any WIN** = Restart counting from 0
+- 🔄 **Daily Restart** = Counter reset regardless (fresh start)
+
+---
+
+
+
+### Safety Features
+
+**Mode Lock:** After auto-switch, mode is locked for 5 minutes (prevents accidental rapid switches)
+
+**Confirmation Required:** Switching to REAL requires typing `confirm-real-mode`
+
+**Audit Trail:** All mode changes logged to `data/logs/mode_changes.log`
+
+**Auto-Restore:** Automatic recovery at 03:00 UTC+1 daily restart (fresh start every day)
 
 ---
 
