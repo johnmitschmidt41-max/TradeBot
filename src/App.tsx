@@ -1,0 +1,455 @@
+import { useEffect, useRef, useState, ReactNode } from 'react';
+import SetupVisualization from './components/SetupVisualization';
+import TradeJournal from './components/TradeJournal';
+
+interface LogBoxProps {
+  title: string;
+  color: string;
+  fullWidth?: boolean;
+}
+
+interface LogEntry {
+  timestamp?: string;
+  level?: string;
+  message?: string;
+  data?: Record<string, any> | null;
+  raw?: string;
+}
+
+const parseLog = (eventData: string): LogEntry => {
+  // eventData can be:
+  // 1) a JSON string of an object: '{"timestamp":"...","message":"...","data":{}}'
+  // 2) a JSON string of a string (double-encoded): '"[time] MSG\n{...}"'
+  // 3) a plain string: '[time] MSG\n{...}' (older behavior)
+
+  try {
+    const parsed = JSON.parse(eventData);
+
+    // If parsing produced an object, return it (structured log)
+    if (parsed && typeof parsed === 'object') return parsed as LogEntry;
+
+    // If parsed is a string, we need to parse its content
+    if (typeof parsed === 'string') {
+      const raw = parsed;
+      // If the string looks like JSON again, try to parse it
+      const trimmed = raw.trim();
+      if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+        try {
+          return JSON.parse(trimmed);
+        } catch (_e) {
+          // fallthrough to textual parsing
+        }
+      }
+
+      // Textual parsing: split into first line and optional JSON body
+      const lines = raw.split('\n');
+      const first = lines[0] || raw;
+      const m = first.match(/^\[(.*?)\]\s*(\w+):?\s*(.*)$/);
+      const timestamp = m ? m[1] : undefined;
+      const level = m && m[2] ? m[2].toUpperCase() : undefined;
+      const message = m ? m[3] : first;
+      let data = null;
+      if (lines.length > 1) {
+        try { data = JSON.parse(lines.slice(1).join('\n')); } catch { data = lines.slice(1).join('\n'); }
+      }
+      return { timestamp, level, message, data };
+    }
+
+    return { raw: String(parsed) };
+  } catch (e) {
+    // eventData was not JSON; parse as plain text (old behavior)
+    const raw = eventData;
+    const lines = raw.split('\n');
+    const first = lines[0] || raw;
+    const m = first.match(/^\[(.*?)\]\s*(\w+):?\s*(.*)$/);
+    const timestamp = m ? m[1] : undefined;
+    const level = m && m[2] ? m[2].toUpperCase() : undefined;
+    const message = m ? m[3] : first;
+    let data = null;
+    if (lines.length > 1) {
+      try { data = JSON.parse(lines.slice(1).join('\n')); } catch { data = lines.slice(1).join('\n'); }
+    }
+    return { timestamp, level, message, data };
+  }
+};
+
+const LogEntry = ({ entry }: { entry: LogEntry }) => {
+  const isDecision = entry.level === 'DECISION';
+  const isError = entry.level === 'ERROR';
+  const isWarn = entry.level === 'WARN';
+  
+  // Terminal-style colors
+  const levelBadgeColor = isDecision ? 'bg-purple-600/20 text-purple-300 border-purple-500/30' 
+    : isError ? 'bg-red-600/20 text-red-300 border-red-500/30' 
+    : isWarn ? 'bg-yellow-600/20 text-yellow-300 border-yellow-500/30' 
+    : 'bg-blue-600/20 text-blue-300 border-blue-500/30';
+  
+  const renderJsonValue = (value: any, indent = 0): ReactNode => {
+    const indentStr = '  '.repeat(indent);
+    
+    if (value === null || value === undefined) {
+      return <span className="text-gray-500">null</span>;
+    }
+    
+    if (Array.isArray(value)) {
+      if (value.length === 0) return <span className="text-cyan-300">[]</span>;
+      return (
+        <>
+          <span className="text-cyan-300">[</span>
+          {value.map((item, idx) => (
+            <div key={idx} style={{ paddingLeft: `${(indent + 1) * 16}px` }}>
+              <span className="text-cyan-300">{'{'}</span>
+              {typeof item === 'object' && item !== null && (
+                <>
+                  {Object.entries(item).map(([k, v], i) => (
+                    <div key={k} style={{ paddingLeft: `${(indent + 2) * 16}px` }}>
+                      <span className="text-green-300">"{k}"</span>
+                      <span className="text-cyan-300">: </span>
+                      {typeof v === 'string' ? (
+                        <span className="text-green-300">"{v}"</span>
+                      ) : typeof v === 'number' ? (
+                        <span className="text-yellow-300">{v}</span>
+                      ) : (
+                        renderJsonValue(v, indent + 2)
+                      )}
+                      {i < Object.entries(item).length - 1 && <span className="text-cyan-300">,</span>}
+                    </div>
+                  ))}
+                </>
+              )}
+              <div style={{ paddingLeft: `${(indent + 1) * 16}px` }}>
+                <span className="text-cyan-300">{'}'}</span>
+                {idx < value.length - 1 && <span className="text-cyan-300">,</span>}
+              </div>
+            </div>
+          ))}
+          <div style={{ paddingLeft: `${indent * 16}px` }}>
+            <span className="text-cyan-300">]</span>
+          </div>
+        </>
+      );
+    }
+    
+    if (typeof value === 'object') {
+      const entries = Object.entries(value);
+      if (entries.length === 0) return <span className="text-cyan-300">{'{}'}</span>;
+      return (
+        <>
+          <span className="text-cyan-300">{'{'}</span>
+          {entries.map(([key, val], idx) => (
+            <div key={key} style={{ paddingLeft: `${(indent + 1) * 16}px` }}>
+              <span className="text-green-300">"{key}"</span>
+              <span className="text-cyan-300">: </span>
+              {typeof val === 'string' ? (
+                <span className="text-green-300">"{val}"</span>
+              ) : typeof val === 'number' ? (
+                <span className="text-yellow-300">{val}</span>
+              ) : typeof val === 'boolean' ? (
+                <span className="text-pink-300">{String(val)}</span>
+              ) : (
+                renderJsonValue(val, indent + 1)
+              )}
+              {idx < entries.length - 1 && <span className="text-cyan-300">,</span>}
+            </div>
+          ))}
+          <div style={{ paddingLeft: `${indent * 16}px` }}>
+            <span className="text-cyan-300">{'}'}</span>
+          </div>
+        </>
+      );
+    }
+    
+    if (typeof value === 'string') {
+      return <span className="text-green-300">"{value}"</span>;
+    }
+    
+    if (typeof value === 'number') {
+      return <span className="text-yellow-300">{value}</span>;
+    }
+    
+    if (typeof value === 'boolean') {
+      return <span className="text-pink-300">{String(value)}</span>;
+    }
+    
+    return <span className="text-gray-300">{String(value)}</span>;
+  };
+  
+  return (
+    <div className="mb-3 font-mono text-xs text-left bg-gray-900/50 rounded p-3 border border-gray-800 overflow-x-auto max-w-full">
+      {/* Decision header (terminal-like) */}
+      {isDecision && (
+        <div className="mb-2">
+          <div className="text-cyan-400">{String('═').repeat(60)}</div>
+          <div className="text-purple-300 font-bold uppercase text-sm mt-1 mb-1">MODEL DECISION</div>
+          <div className="text-cyan-400">{String('─').repeat(60)}</div>
+        </div>
+      )}
+      {/* Header */}
+      <div className="flex items-center gap-2 mb-2">
+        <span className="text-gray-500">[{entry.timestamp}]</span>
+        <span className={`px-2 py-0.5 rounded border font-semibold text-xs ${levelBadgeColor}`}>
+          {entry.level}
+        </span>
+        <span className="text-gray-300">{entry.message}</span>
+      </div>
+      
+      {/* JSON Data */}
+      {entry.data && Object.keys(entry.data).length > 0 && (
+        <div className="mt-2 pl-4 border-l-2 border-gray-700 text-gray-300 overflow-x-auto break-all max-w-full">
+          <pre className="whitespace-pre-wrap break-all">{JSON.stringify(entry.data, null, 2)}</pre>
+        </div>
+      )}
+    </div>
+  );
+};
+
+const LogBox = ({ title, color, fullWidth = false }: LogBoxProps) => {
+  const [logs, setLogs] = useState<LogEntry[]>([]);
+  const [isConnected, setIsConnected] = useState(false);
+  const [isLoading, setIsLoading] = useState(false);
+  const maxLogs = 500;
+  const boxHeight = fullWidth ? 'h-[500px]' : 'h-[400px]';
+  
+  // Map title to service name for API calls
+  const serviceName = title.toLowerCase().replace(/\s+/g, '-');
+
+  useEffect(() => {
+    const eventSource = new EventSource(`/api/logs/${serviceName}`);
+
+    eventSource.onopen = () => {
+      setIsConnected(true);
+      setLogs([]);
+    };
+
+    eventSource.onmessage = (event) => {
+      try {
+        const parsed = parseLog(event.data);
+        console.log('Parsed log:', parsed);
+        setLogs((prevLogs) => {
+          const updated = [...prevLogs, parsed];
+          return updated.length > maxLogs ? updated.slice(-maxLogs) : updated;
+        });
+      } catch (e) {
+        console.error('Parse error:', e);
+        // Fallback
+        setLogs((prevLogs) => {
+          const updated = [...prevLogs, { raw: event.data }];
+          return updated.length > maxLogs ? updated.slice(-maxLogs) : updated;
+        });
+      }
+    };
+
+    eventSource.onerror = () => {
+      setIsConnected(false);
+      eventSource.close();
+    };
+
+    return () => eventSource.close();
+  }, [serviceName]);
+
+  // Auto-scroll only within the log container, not the page
+  const logContainerRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (logContainerRef.current) {
+      logContainerRef.current.scrollTop = logContainerRef.current.scrollHeight;
+    }
+  }, [logs]);
+
+  // Service control functions
+  const handleStart = async () => {
+    setIsLoading(true);
+    try {
+      const res = await fetch(`/api/service/${serviceName}/start`, { method: 'POST' });
+      const data = await res.json();
+      if (!res.ok) console.error('Start failed:', data.error);
+    } catch (e) {
+      console.error('Start error:', e);
+    }
+    setIsLoading(false);
+  };
+
+  const handleStop = async () => {
+    setIsLoading(true);
+    try {
+      const res = await fetch(`/api/service/${serviceName}/stop`, { method: 'POST' });
+      const data = await res.json();
+      if (!res.ok) console.error('Stop failed:', data.error);
+    } catch (e) {
+      console.error('Stop error:', e);
+    }
+    setIsLoading(false);
+  };
+
+  const handleRestart = async () => {
+    setIsLoading(true);
+    try {
+      const res = await fetch(`/api/service/${serviceName}/restart`, { method: 'POST' });
+      const data = await res.json();
+      if (!res.ok) console.error('Restart failed:', data.error);
+    } catch (e) {
+      console.error('Restart error:', e);
+    }
+    setIsLoading(false);
+  };
+
+  const handleClearLogs = () => {
+    setLogs([]);
+  };
+
+  const statusColor = isConnected ? 'bg-green-500' : 'bg-red-500';
+  const borderColor = color;
+
+  return (
+    <div className={`flex flex-col bg-gray-900 rounded-lg border-2 ${borderColor} overflow-hidden ${boxHeight} shadow-xl`}>
+      {/* Header */}
+      <div className="bg-gray-800 px-4 py-2 border-b border-gray-700 flex items-center justify-between">
+        <div className="flex items-center gap-2">
+          <h2 className="text-sm font-semibold text-white">{title}</h2>
+          <div className={`w-2 h-2 rounded-full ${statusColor} shadow-lg`}></div>
+        </div>
+        
+        {/* Control Buttons */}
+        <div className="flex items-center gap-1">
+          <button
+            onClick={handleStart}
+            disabled={isLoading}
+            className="px-2 py-1 text-xs bg-green-600 hover:bg-green-700 disabled:bg-gray-600 text-white rounded transition-colors"
+            title="Start"
+          >
+            Start
+          </button>
+          <button
+            onClick={handleStop}
+            disabled={isLoading}
+            className="px-2 py-1 text-xs bg-red-600 hover:bg-red-700 disabled:bg-gray-600 text-white rounded transition-colors"
+            title="Stop"
+          >
+            Stop
+          </button>
+          <button
+            onClick={handleRestart}
+            disabled={isLoading}
+            className="px-2 py-1 text-xs bg-yellow-600 hover:bg-yellow-700 disabled:bg-gray-600 text-white rounded transition-colors"
+            title="Restart"
+          >
+            Restart
+          </button>
+          <button
+            onClick={handleClearLogs}
+            className="px-2 py-1 text-xs bg-gray-600 hover:bg-gray-700 text-white rounded transition-colors"
+            title="Clear Logs"
+          >
+            Clear
+          </button>
+        </div>
+      </div>
+
+      {/* Log Container */}
+      <div ref={logContainerRef} className="flex-1 overflow-y-auto p-4 bg-gray-950">
+        {logs.length === 0 ? (
+          <div className="text-gray-500 text-center py-8">
+            {isConnected ? 'Waiting for logs...' : 'Connecting...'}
+          </div>
+        ) : (
+          logs.map((log, idx) => {
+            // If we have a raw string, try to parse it to structured before rendering.
+            if (log.raw) {
+              try {
+                const parsed = parseLog(log.raw);
+                if (!parsed.raw && (parsed.message || parsed.data)) {
+                  return <LogEntry key={idx} entry={parsed} />;
+                }
+              } catch (_e) {
+                // ignore and fallthrough to raw string rendering
+              }
+
+              return (
+                <div
+                  key={idx}
+                  className="text-gray-400 text-xs mb-2 p-2 bg-gray-800 rounded whitespace-pre-wrap break-words"
+                >
+                  {log.raw}
+                </div>
+              );
+            }
+
+            return <LogEntry key={idx} entry={log} />;
+          })
+        )}
+      </div>
+
+      {/* Footer */}
+      <div className="bg-gray-800 px-4 py-2 border-t border-gray-700 text-xs text-gray-500">
+        {logs.length} logs • Auto-scroll enabled
+      </div>
+    </div>
+  );
+};
+
+export default function App() {
+  const [showJournal, setShowJournal] = useState(false);
+
+  return (
+    <div className="min-h-screen bg-gray-950 p-6">
+      {/* Header */}
+      <div className="max-w-7xl mx-auto mb-6">
+        <div className="flex items-center justify-between">
+          <div>
+            <h1 className="text-3xl font-bold bg-gradient-to-r from-blue-400 via-purple-400 to-pink-400 bg-clip-text text-transparent">
+              TradeBot Dashboard
+            </h1>
+            <p className="text-gray-400 text-sm mt-1">Real-time monitoring | Live setups | Trade journal</p>
+          </div>
+          <button
+            onClick={() => setShowJournal(!showJournal)}
+            className={`px-4 py-2 rounded-lg font-medium transition-all ${
+              showJournal
+                ? 'bg-green-600 text-white'
+                : 'bg-gray-800 text-gray-400 hover:bg-gray-700 hover:text-white'
+            }`}
+          >
+            {showJournal ? 'Hide Journal' : 'Trade Journal'}
+          </button>
+        </div>
+      </div>
+
+      {/* Trade Journal (toggleable) */}
+      {showJournal && (
+        <div className="max-w-7xl mx-auto mb-6">
+          <TradeJournal />
+        </div>
+      )}
+
+      {/* Live Setup Visualization - Always visible on top */}
+      <div className="max-w-7xl mx-auto mb-6">
+        <SetupVisualization />
+      </div>
+
+      {/* MainBot Log - Full width on top */}
+      <div className="max-w-7xl mx-auto mb-4">
+        <LogBox
+          title="MainBot"
+          color="border-blue-500"
+          fullWidth={true}
+        />
+      </div>
+
+      {/* Bridge and Scorer Logs - Side by side below */}
+      <div className="max-w-7xl mx-auto grid grid-cols-1 lg:grid-cols-2 gap-4">
+        <LogBox
+          title="Python Bridge"
+          color="border-yellow-500"
+        />
+        <LogBox
+          title="Scorer"
+          color="border-green-500"
+        />
+      </div>
+
+      {/* Footer */}
+      <div className="max-w-7xl mx-auto mt-6 text-center text-gray-600 text-sm">
+        <p>SweepFVG Strategy | London + NY Sessions | MongoDB Trade Storage</p>
+      </div>
+    </div>
+  );
+}
