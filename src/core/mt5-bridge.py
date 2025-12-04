@@ -1,14 +1,49 @@
 print("script started")
 
+# -- Redirect stdout/stderr to dashboard logger (MUST be first!) --
+import sys
+import os
+sys.path.insert(0, os.path.dirname(__file__))
+from dashboard_logger import setup_dashboard_logging
+setup_dashboard_logging('python-bridge')
+
 import MetaTrader5 as mt5
 from flask import Flask, request, jsonify
 from datetime import datetime, timedelta
 from flask_cors import CORS
-import sys
 import time
 import json
-import os
 import threading
+
+# -- optional dashboard logging helper (non-blocking, best-effort) --
+LOG_SERVER_URL = os.environ.get('LOG_SERVER_URL', 'http://localhost:3001')
+
+def _send_log(payload):
+    try:
+        # try requests if available
+        import requests
+        requests.post(f"{LOG_SERVER_URL}/api/log", json=payload, timeout=0.5)
+        return
+    except Exception:
+        pass
+
+    try:
+        # fallback to urllib
+        from urllib import request as _ur
+        import json as _json
+        _r = _ur.Request(f"{LOG_SERVER_URL}/api/log", data=_json.dumps(payload).encode('utf8'), headers={'Content-Type': 'application/json'})
+        _ur.urlopen(_r, timeout=0.5)
+    except Exception:
+        pass
+
+def log_dashboard(message, level='info'):
+    payload = {'service': 'python-bridge', 'message': str(message), 'level': level}
+    # fire-and-forget
+    try:
+        import threading as _threading
+        _threading.Thread(target=_send_log, args=(payload,), daemon=True).start()
+    except Exception:
+        _send_log(payload)
 
 app = Flask(__name__)
 CORS(app)
@@ -49,6 +84,7 @@ if not config:
 # Get current mode
 CURRENT_MODE = get_current_mode()
 print(f"📋 Current trading mode: {CURRENT_MODE}")
+log_dashboard(f"Current trading mode: {CURRENT_MODE}")
 
 # Load account info based on current mode
 account_config = config["accounts"].get(CURRENT_MODE)
@@ -62,6 +98,7 @@ SERVER = account_config["server"]
 MT5_PATH = config.get("mt5Path", r"C:\Program Files\MetaTrader 5 EXNESS\terminal64.exe")
 
 print(f"🔐 Logging in to {CURRENT_MODE} account: {ACCOUNT} @ {SERVER}")
+log_dashboard(f"Logging in to {CURRENT_MODE} account: {ACCOUNT} @ {SERVER}")
 
 mt5_initialized = False
 last_known_mode = CURRENT_MODE  # Track mode changes
@@ -119,18 +156,25 @@ def init_mt5():
     global mt5_initialized
 
     print("Initializing MT5…")
+    log_dashboard("Initializing MT5…")
 
     if not mt5.initialize(MT5_PATH):
-        print("❌ MT5 initialize() FAILED:", mt5.last_error())
+        err = mt5.last_error()
+        print("❌ MT5 initialize() FAILED:", err)
+        log_dashboard(f"MT5 initialize FAILED: {err}", level='error')
         return False
 
     authorized = mt5.login(ACCOUNT, password=PASSWORD, server=SERVER)
 
     if not authorized:
-        print("❌ MT5 login FAILED:", mt5.last_error())
+        err = mt5.last_error()
+        print("❌ MT5 login FAILED:", err)
+        log_dashboard(f"MT5 login FAILED: {err}", level='error')
         return False
 
-    print("✅ MT5 connected:", mt5.account_info())
+    acc_info = mt5.account_info()
+    print("✅ MT5 connected:", acc_info)
+    log_dashboard(f"MT5 connected: {acc_info}")
     mt5_initialized = True
     return True
 
@@ -402,9 +446,34 @@ def get_deals():
             })
 
         return jsonify({"deals": deal_list})
+
     except Exception as e:
         print('❌ Error fetching deals:', e)
         return jsonify({"deals": []}), 500
+
+
+@app.route('/tick', methods=['GET'])
+def get_tick():
+        """Return current tick (bid/ask/spread) for a symbol (query param `symbol`)."""
+        if not mt5_initialized:
+            return jsonify({"error": "MT5 not connected"}), 500
+
+        symbol = request.args.get('symbol')
+        if not symbol:
+            return jsonify({"error": "symbol required"}), 400
+
+        try:
+            tick = mt5.symbol_info_tick(symbol)
+            if tick is None:
+                return jsonify({"error": f"no tick for {symbol}"}), 404
+
+            bid = float(tick.bid)
+            ask = float(tick.ask)
+            spread = ask - bid
+            return jsonify({"symbol": symbol, "bid": bid, "ask": ask, "spread": spread})
+        except Exception as e:
+            print(f"❌ Failed to fetch tick for {symbol}: {e}")
+            return jsonify({"error": str(e)}), 500
 
 
 def background_mode_checker():
@@ -420,9 +489,10 @@ def background_mode_checker():
             # Always call check_mode_change to let it handle the comparison
             check_mode_change()
             
-            # Log periodic checks every 10 checks (50 seconds) to show it's alive
-            if check_count % 10 == 0:
-                print(f"✅ Mode check #{check_count}: {CURRENT_MODE} account {ACCOUNT} @ {SERVER}")
+            # Log every 60 checks (5 minutes) to show it's alive, reset counter
+            if check_count >= 60:
+                print(f"✅ Mode check: {CURRENT_MODE} account {ACCOUNT} @ {SERVER}")
+                check_count = 0
         except Exception as e:
             print(f"⚠️  Mode checker error: {e}")
 

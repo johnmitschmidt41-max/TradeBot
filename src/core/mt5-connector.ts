@@ -29,6 +29,10 @@ export interface AccountInfo {
 
 export class MT5Connector {
   private isConnected = false;
+  // In-memory cache for account info requests to avoid rapid repeated /account calls
+  private accountCache: { ts: number; data: AccountInfo | null } | null = null;
+  // configurable TTL for account cache (milliseconds)
+  private accountCacheTTL = Number(process.env.MT5_ACCOUNT_CACHE_TTL_MS || 2000);
 
   async login(account: number, password: string, server: string): Promise<void> {
     const response = await axios.post(`${MT5_BRIDGE_URL}/login`, {
@@ -117,10 +121,21 @@ export class MT5Connector {
   }
 
   // NEW: account info (balance, equity, etc.)
-  async getAccountInfo(): Promise<AccountInfo | null> {
+  async getAccountInfo(forceRefresh = false): Promise<AccountInfo | null> {
     try {
+      // honor in-memory cache to avoid hammering the MT5 bridge
+      if (!forceRefresh && this.accountCache) {
+        const age = Date.now() - this.accountCache.ts;
+        if (age <= this.accountCacheTTL) {
+          // Cache hit — return cached value
+          // Note: use a shallow copy to avoid accidental modification
+          return { ...this.accountCache.data } as AccountInfo | null;
+        }
+      }
       const response = await axios.get(`${MT5_BRIDGE_URL}/account`);
-      return response.data.account ?? null;
+      const account = response.data.account ?? null;
+      this.accountCache = { ts: Date.now(), data: account };
+      return account;
     } catch (err:any) {
       logConnectorError('/account', err);
       return null;
@@ -136,6 +151,21 @@ export class MT5Connector {
     } catch (err:any) {
       logConnectorError('/deals', err);
       throw err; // Let callers handle retries
+    }
+  }
+
+  // Fetch current tick (bid/ask/spread) for a symbol
+  async getTick(symbol: string): Promise<{ bid: number; ask: number; spread: number } | null> {
+    try {
+      const response = await axios.get(`${MT5_BRIDGE_URL}/tick?symbol=${encodeURIComponent(symbol)}`);
+      const data = response.data;
+      if (data && typeof data.bid === 'number' && typeof data.ask === 'number') {
+        return { bid: data.bid, ask: data.ask, spread: data.spread };
+      }
+      return null;
+    } catch (err:any) {
+      logConnectorError('/tick', err);
+      return null;
     }
   }
 

@@ -15,7 +15,9 @@ export function computeVolume(
 ): number {
 
     const riskUSD = balance * (riskPercent / 100);
-    if (riskUSD <= 0 || stopLossPips <= 0) return 0.01;
+    // Safety: if the configured risk percent or computed risk in USD is zero or negative, return 0 lots
+    // This prevents the system from silently trading non-zero lots when risk is 0.
+    if (riskUSD <= 0 || stopLossPips <= 0) return 0;
 
     const s = symbol.replace("z", "").toUpperCase();
 
@@ -27,8 +29,10 @@ export function computeVolume(
 
     const pipSize =
         s.includes("JPY") ? 0.01 :
+        // Align pip size with src/utils/pip.priceToPip: XAU uses 0.01 pip granularity
         s === "XAUUSD" ? 0.01 :
-        s === "XAGUSD" ? 0.01 :
+        // Use default forex pip for metals like XAG as 0.0001 (consistent with priceToPip default)
+        s === "XAGUSD" ? 0.0001 :
         0.0001;
 
     const pipValuePerLot = contractSize * pipSize;
@@ -58,8 +62,8 @@ export function pipValuePerLot(symbol: string): number {
 
     const pipSize =
         s.includes("JPY") ? 0.01 :
-        s === "XAUUSD" ? 0.01 :
-        s === "XAGUSD" ? 0.01 :
+            s === "XAUUSD" ? 0.01 :
+            s === "XAGUSD" ? 0.0001 :
         0.0001;
 
     return contractSize * pipSize;
@@ -79,8 +83,8 @@ export function getSymbolMeta(symbol: string): { contractSize: number; pipSize: 
 
     const pipSize =
         s.includes("JPY") ? 0.01 :
-        s === "XAUUSD" ? 0.01 :
-        s === "XAGUSD" ? 0.01 :
+            s === "XAUUSD" ? 0.01 :
+            s === "XAGUSD" ? 0.0001 :
         0.0001;
 
     return { contractSize, pipSize };

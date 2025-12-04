@@ -1,37 +1,39 @@
 import 'dotenv/config';
 import { MT5Connector } from "./core/mt5-connector";
-import { Strategy } from "./strategy/jusdtt-m15";
+import { SweepFVGStrategy } from "./strategy/sweep-fvg-strategy";
 import { info, error } from "./utils/logger";
 import axios from "axios";
 
 const BRIDGE = process.env.MT5_BRIDGE || "http://163.5.210.176:5000";
 
 async function run() {
-  // eslint-disable-next-line @typescript-eslint/no-var-requires
-  const { MT5Connector } = require("./core/mt5-connector") as typeof import("./core/mt5-connector");
+  
   const connector = new MT5Connector();
 
   try {
     const health = await axios.get(`${BRIDGE}/health`).then(r => r.data).catch(() => null);
-    info('Bridge health', health);
+    info('STARTUP', 'Bridge health check', health);
   } catch (e) {
-    error('Bridge unreachable, ensure mt5-bridge.py is running on RDP and BRIDGE env var is set');
+    error('STARTUP', 'Bridge unreachable - ensure mt5-bridge.py is running');
   }
 
-  const strategy = new Strategy(connector);
+  // New SweepFVG Strategy
+  const strategy = new SweepFVGStrategy(connector, {
+    riskPercent: 1.0,
+    maxTradesPerDay: 12,
+    maxTradesPerSymbol: 4
+  });
 
-  setInterval(async () => {
-    try {
-      await strategy.scanAndAct();
-    } catch (err) {
-      error('Main loop error', err);
-    }
-  }, 30_000);
+  info('STARTUP', 'Bot started - SweepFVG Strategy', {
+    symbols: ['GBPUSDz', 'EURUSDz', 'XAUUSDz'],
+    sessions: 'London + NY'
+  });
 
-  info('Bot started. Monitoring symbols: GBPUSD, EURUSD, XAUUSD on M15');
+  // Run the strategy
+  await strategy.run();
 }
 
 run().catch(err => {
-  error('Fatal', err);
+  error('FATAL', 'Startup error', err);
   process.exit(1);
 });
