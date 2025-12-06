@@ -65,7 +65,7 @@ export class MT5Connector {
 
   async placeOrder(params: {
     symbol: string;
-    type: 'BUY' | 'SELL';
+    type: 'BUY' | 'SELL' | 'BUY_LIMIT' | 'SELL_LIMIT' | 'BUY_STOP' | 'SELL_STOP';
     volume: number;
     price?: number;
     sl: number;
@@ -115,6 +115,11 @@ export class MT5Connector {
       const response = await axios.get(url);
       return response.data.orders || [];
     } catch (err:any) {
+      // If 503 or 500, throw error so we don't assume empty list
+      if (err.response && (err.response.status === 503 || err.response.status === 500)) {
+        console.warn(`[mt5-connector] MT5 Bridge error fetching orders: ${err.response.data?.error || err.message}`);
+        throw new Error(`MT5 Bridge Error: ${err.response.data?.error || err.message}`);
+      }
       logConnectorError('/orders?symbol', err);
       throw err;
     }
@@ -151,6 +156,17 @@ export class MT5Connector {
     } catch (err:any) {
       logConnectorError('/deals', err);
       throw err; // Let callers handle retries
+    }
+  }
+
+  // Cancel/delete a pending order
+  async cancelOrder(ticket: number): Promise<any> {
+    try {
+      const response = await axios.post(`${MT5_BRIDGE_URL}/cancel-order`, { ticket });
+      return response.data;
+    } catch (err:any) {
+      logConnectorError('/cancel-order', err);
+      throw err;
     }
   }
 

@@ -2,14 +2,37 @@
 // New modular strategy: Liquidity Sweep + FVG Entry
 // Targets 7-12 trades/day with ~70% win rate
 
+import * as fs from 'fs';
+import * as path from 'path';
 import { DataFeed } from "../core/data-feed";
 import { OrderManager } from "../core/order-manager";
 import { MT5Connector } from "../core/mt5-connector";
 import { detectFVG, FVG } from "../detectors/fvg-detector";
+import { detectReversalPattern, isMomentumFading, ReversalPattern } from "../detectors/double-top-bottom-detector";
 import { computeVolume } from "../core/position-sizing";
 import { getSessionManager, SessionManager, SessionName } from "../core/session-manager";
 import { info, warn } from "../utils/logger";
 import { Candle } from "../utils/types";
+import { OrderDatabase, PendingOrderRecord } from "../core/order-db";
+
+// ═══════════════════════════════════════════════════════════════════
+// HELPER: Get correct pip size for symbol
+// ═══════════════════════════════════════════════════════════════════
+
+function getPipSize(symbol: string): number {
+  const s = symbol.toUpperCase();
+  if (s.includes('XAU')) return 0.1;        // Gold: $0.10 per pip
+  if (s.includes('JPY')) return 0.01;       // JPY pairs: 0.01 per pip
+  return 0.0001;                             // Standard FX: 0.0001 per pip
+}
+
+function isXAUSymbol(symbol: string): boolean {
+  return symbol.toUpperCase().includes('XAU');
+}
+
+function isJPYSymbol(symbol: string): boolean {
+  return symbol.toUpperCase().includes('JPY');
+}
 
 // ═══════════════════════════════════════════════════════════════════
 // CONFIGURATION
@@ -60,9 +83,9 @@ interface StrategyConfig {
 }
 
 const DEFAULT_CONFIG: StrategyConfig = {
-  symbols: ['GBPUSDz', 'EURUSDz', 'XAUUSDz', 'USDJPYz', 'AUDUSDz', 'NZDUSDz', 'USDCADz'],
+  symbols: ['GBPUSDz', 'EURUSDz', 'XAUUSDz', 'USDJPYz', 'AUDUSDz', 'NZDUSDz', 'USDCADz', 'EURJPYz'],
   entryTimeframe: 'M5',
-  riskPercent: 1.0,
+  riskPercent: 10.0,
   maxTradesPerDay: 20,  // Increased for more symbols
   maxTradesPerSymbol: 3,
   
@@ -99,7 +122,7 @@ const DEFAULT_CONFIG: StrategyConfig = {
 // TYPES
 // ═══════════════════════════════════════════════════════════════════
 
-type SetupType = 'reversal' | 'continuation' | 'trend';
+type SetupType = 'reversal' | 'continuation' | 'trend' | 'double_top' | 'double_bottom' | 'triple_top' | 'triple_bottom';
 
 interface PendingSetup {
   symbol: string;
@@ -108,16 +131,21 @@ interface PendingSetup {
   sweepTime: Date;
   sweepSession: SessionName;
   fvg: FVG | null;
+  reversalPattern?: ReversalPattern;  // Double/Triple Top/Bottom pattern
   candlesSinceSweep: number;
   lastCandleTime: number;      // Track candle time to only count new candles
   entryPrice: number | null;
   sl: number | null;
   tp: number | null;
-  status: 'waiting_fvg' | 'waiting_entry' | 'ready' | 'continuation' | 'trend_entry';
+  status: 'waiting_fvg' | 'waiting_entry' | 'ready' | 'continuation' | 'trend_entry' | 'pattern_entry' | 'invalidated' | 'pending_order';
   setupType: SetupType;
   highestAfterSweep?: number;  // Track momentum after sweep
   lowestAfterSweep?: number;
   failedAttempts?: number;     // Track failed sweep/reversal attempts
+  // Pending order tracking
+  pendingOrderTicket?: number;
+  pendingOrderType?: string;   // BUY_LIMIT, SELL_LIMIT, BUY_STOP, SELL_STOP
+  pendingOrderPlacedAt?: Date;
 }
 
 // Track trend state per symbol
@@ -169,9 +197,48 @@ export class SweepFVGStrategy {
   private sessionStartTime: Map<string, Date> = new Map();  // When current session started
   private lastActiveSession: string = '';  // Track session changes
   
+  // Track open positions to detect when they close
+  private openTrades: Map<string, { ticket: number; symbol: string; side: 'BUY' | 'SELL'; entry: number; sl: number; tp: number; openTime: Date }> = new Map();
+  
+  // Track recently closed trades to prevent immediate re-entry
+  // Key: symbol, Value: timestamp when trade closed
+  private recentlyClosedTrades: Map<string, number> = new Map();
+  private readonly COOLDOWN_MINUTES = 15;  // Wait 15 mins after trade closes before new setup
+  
+  // Track recently cancelled orders to prevent "loop of death"
+  // Key: symbol, Value: timestamp when order was cancelled
+  private recentlyCancelledOrders: Map<string, number> = new Map();
+  private readonly CANCEL_COOLDOWN_MINUTES = 5;  // Wait 5 mins after order cancelled before new setup
+  
+  // Track recently used sweep levels to prevent re-entering same zone
+  // Key: symbol, Value: { level: number, time: number, side: 'BUY' | 'SELL' }
+  private recentlyUsedLevels: Map<string, { level: number; time: number; side: 'BUY' | 'SELL' }> = new Map();
+  private readonly LEVEL_COOLDOWN_MINUTES = 60;  // Don't use same sweep level for 60 mins
+  private readonly LEVELS_FILE = path.join(__dirname, '../../data/output/used_levels.json');
+  
+  // JSON database for persistent order tracking
+  private orderDB: OrderDatabase;
+  
   // Config for mode switching
   private readonly SWEEP_WINDOW_MINUTES = 120;  // 2 hours to find sweeps
   private readonly MAX_SWEEP_FAILURES = 3;      // Switch after 3 failures
+  
+  // Market hours config (UTC)
+  // Rollover is typically 21:00-22:00 UTC (10pm-11pm UTC+1)
+  // Weekend: Friday 21:00 UTC to Sunday 21:00 UTC
+  private readonly ROLLOVER_START_UTC = 21;  // 9pm UTC = 10pm UTC+1
+  private readonly ROLLOVER_END_UTC = 22;    // 10pm UTC = 11pm UTC+1
+  private readonly WEEKEND_CLOSE_DAY = 5;    // Friday
+  private readonly WEEKEND_CLOSE_HOUR = 21;  // 9pm UTC Friday
+  private readonly WEEKEND_OPEN_DAY = 0;     // Sunday
+  private readonly WEEKEND_OPEN_HOUR = 21;   // 9pm UTC Sunday
+  
+  // Track if we already cancelled orders for rollover/weekend (prevent repeated cancellations)
+  private rolloverCancelledToday = false;
+  private lastRolloverCancelDate = '';
+  
+  // Startup timestamp for grace period
+  private readonly startTime: number = Date.now();
 
   constructor(private connector: MT5Connector, config?: Partial<StrategyConfig>) {
     this.dataFeed = new DataFeed(connector);
@@ -179,10 +246,18 @@ export class SweepFVGStrategy {
     this.sessionManager = getSessionManager(DEFAULT_CONFIG.symbols);
     this.config = { ...DEFAULT_CONFIG, ...config };
     
+    // Initialize order database for persistent tracking
+    this.orderDB = new OrderDatabase();
+    
     // Initialize all symbols in sweep mode
     for (const symbol of this.config.symbols) {
       this.tradingMode.set(symbol, 'sweep');
     }
+    
+    // Load persisted used levels from file (survives restarts)
+    this.loadUsedLevels();
+    
+    // NOTE: recoverPendingOrders() is now called in run() since it's async
     
     info('STRATEGY', 'SweepFVG Strategy initialized', {
       symbols: this.config.symbols,
@@ -200,6 +275,10 @@ export class SweepFVGStrategy {
 
   async run(): Promise<void> {
     info('STRATEGY', 'Starting SweepFVG Strategy loop...');
+    
+    // Recover any pending orders from database (survives restarts)
+    // This MUST happen before warm-up so frontend gets the state immediately
+    await this.recoverPendingOrders();
     
     // Warm up session levels with historical data
     await this.warmUpSessionLevels();
@@ -341,9 +420,51 @@ export class SweepFVGStrategy {
   async tick(): Promise<void> {
     const now = new Date();
     this.resetDailyCountsIfNeeded(now);
+    this.resetRolloverFlagIfNeeded(now);
     
     // Log status every 30 seconds
     this.logStatusUpdate(now);
+    
+    // Monitor open trades - ALWAYS check (even during rollover/weekend)
+    // Open trades should be left to hit TP/SL naturally
+    await this.monitorOpenTrades();
+    
+    // ═══════════════════════════════════════════════════════════════════
+    // MARKET CLOSED / ROLLOVER CHECKS
+    // ═══════════════════════════════════════════════════════════════════
+    
+    // Check if market is closed (weekend)
+    if (this.isMarketClosed(now)) {
+      // Cancel any pending orders if approaching weekend close
+      if (this.isApproachingWeekendClose(now)) {
+        await this.cancelAllPendingOrdersForRollover('weekend');
+      }
+      
+      const day = now.getUTCDay();
+      const hour = now.getUTCHours();
+      info('MARKET', `Market CLOSED (Weekend) - Day: ${day}, Hour: ${hour} UTC. Waiting for Sunday 21:00 UTC...`);
+      return;  // Skip all trading actions
+    }
+    
+    // Check if approaching rollover - cancel pending orders
+    if (this.isApproachingRollover(now)) {
+      await this.cancelAllPendingOrdersForRollover('rollover');
+    }
+    
+    // Check if in rollover period - pause new actions
+    if (this.isRolloverPeriod(now)) {
+      const hour = now.getUTCHours();
+      const minute = now.getUTCMinutes();
+      info('MARKET', `ROLLOVER period (${hour}:${minute.toString().padStart(2, '0')} UTC) - Pausing new actions until ${this.ROLLOVER_END_UTC}:00 UTC`);
+      return;  // Skip trading actions but keep monitoring
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════
+    // NORMAL TRADING LOGIC
+    // ═══════════════════════════════════════════════════════════════════
+    
+    // Monitor pending orders - check if filled, invalidated, or missed
+    await this.monitorPendingOrders();
     
     // Check if we're in a trading session
     const activeSessions = this.sessionManager.getActiveSessions(now);
@@ -363,6 +484,573 @@ export class SweepFVGStrategy {
     // Process each symbol
     for (const symbol of this.config.symbols) {
       await this.processSymbol(symbol, now, activeSessions);
+    }
+  }
+
+  /**
+   * Monitor open trades and detect when they close
+   * Also detects trades opened externally (manually or by other EAs)
+   */
+  private async monitorOpenTrades(): Promise<void> {
+    // Check ALL symbols for open positions (including manually opened)
+    for (const symbol of this.config.symbols) {
+      try {
+        const openPositions = await this.connector.getOpenPositions(symbol);
+        const trackedTrade = this.openTrades.get(symbol);
+        const pendingSetup = this.pendingSetups.get(symbol);
+        
+        if (openPositions && openPositions.length > 0) {
+          const position = openPositions[0]; // Take first position on this symbol
+          
+          // Handle both formats: price_open (from bridge) or openPrice
+          const entryPrice = position.price_open || position.openPrice || 0;
+          // Handle type as string "BUY"/"SELL" or number 0/1
+          const side: 'BUY' | 'SELL' = (position.type === 'BUY' || position.type === 0) ? 'BUY' : 'SELL';
+          
+          // If we're not tracking this position yet, start tracking it
+          if (!trackedTrade || trackedTrade.ticket !== position.ticket) {
+            info('MONITOR', `Detected open position on ${symbol}`, {
+              ticket: position.ticket,
+              type: position.type,
+              side,
+              volume: position.volume,
+              entryPrice
+            });
+            
+            // Check if this trade matches a pending setup (manual entry of bot's setup)
+            if (pendingSetup && pendingSetup.entryPrice) {
+              const isXAU = isXAUSymbol(symbol);
+              const isJPY = isJPYSymbol(symbol);
+              const pipSize = getPipSize(symbol);
+              
+              // Tolerance: 10 pips for FX, $1 for XAU, 10 pips for JPY
+              const tolerance = isXAU ? 10.0 : isJPY ? 0.10 : 0.0010;
+              
+              const entryClose = Math.abs(entryPrice - pendingSetup.entryPrice) <= tolerance;
+              const sideMatch = pendingSetup.side === side;
+              
+              if (entryClose && sideMatch) {
+                info('MONITOR', `Manual trade matches pending setup - clearing setup`, {
+                  setupEntry: pendingSetup.entryPrice,
+                  tradeEntry: entryPrice,
+                  diff: Math.abs(entryPrice - pendingSetup.entryPrice).toFixed(isXAU ? 2 : 5)
+                });
+                // Mark the sweep level as used so we don't re-enter same zone
+                this.markLevelUsed(symbol, pendingSetup.sweepLevel, side);
+                this.pendingSetups.delete(symbol);
+              }
+            }
+            
+            // Add to tracking
+            this.openTrades.set(symbol, {
+              ticket: position.ticket,
+              symbol,
+              side,
+              entry: entryPrice,
+              sl: position.sl || 0,
+              tp: position.tp || 0,
+              openTime: new Date()
+            });
+          }
+          
+          // Send live P/L update
+          const trade = this.openTrades.get(symbol)!;
+          const tick = await this.connector.getTick(symbol);
+          if (tick) {
+            const currentPrice = trade.side === 'BUY' ? tick.bid : tick.ask;
+            const isXAU = symbol.includes('XAU');
+            const pipSize = getPipSize(symbol);
+            const unrealizedPips = trade.side === 'BUY' 
+              ? (currentPrice - trade.entry) / pipSize
+              : (trade.entry - currentPrice) / pipSize;
+            
+            await this.sendOpenTradeUpdate(trade, currentPrice, unrealizedPips);
+          }
+        } else if (trackedTrade) {
+          // Position was closed!
+          const tick = await this.connector.getTick(symbol);
+          const closePrice = tick?.bid || trackedTrade.entry;
+          
+          const isXAU = symbol.includes('XAU');
+          const pipSize = getPipSize(symbol);
+          
+          let pnlPips = 0;
+          let result: 'win' | 'loss' | 'breakeven' = 'breakeven';
+          
+          if (trackedTrade.side === 'BUY') {
+            pnlPips = (closePrice - trackedTrade.entry) / pipSize;
+          } else {
+            pnlPips = (trackedTrade.entry - closePrice) / pipSize;
+          }
+          
+          if (pnlPips > 5) {
+            result = 'win';
+          } else if (pnlPips < -5) {
+            result = 'loss';
+          }
+          
+          info('TRADE_CLOSED', `${symbol} ${trackedTrade.side} closed`, {
+            ticket: trackedTrade.ticket,
+            entry: trackedTrade.entry,
+            closePrice,
+            pnlPips: pnlPips.toFixed(1),
+            result
+          });
+          
+          // Send close update to frontend
+          await this.sendTradeCloseToAPI(trackedTrade, closePrice, pnlPips, result);
+          
+          // Remove from tracking
+          this.openTrades.delete(symbol);
+          
+          // Start cooldown to prevent immediate re-entry
+          this.markTradeClosed(symbol);
+          
+          // Clear any pending setup for this symbol
+          if (this.pendingSetups.has(symbol)) {
+            this.pendingSetups.delete(symbol);
+          }
+          
+          // Send scanning status to dashboard
+          await this.sendSetupToAPI(symbol, null);
+        }
+      } catch (err: any) {
+        // Silent - don't spam logs
+      }
+    }
+  }
+
+  /**
+   * Synchronize database with MT5 - clean up orders that were manually deleted
+   * This ensures we don't have stale entries in our database
+   */
+  private async syncDatabaseWithMT5(): Promise<void> {
+    // Don't sync/delete in the first 30 seconds of bot startup
+    // This gives MT5 bridge time to stabilize and ensures we don't falsely delete orders
+    if (Date.now() - this.startTime < 30000) {
+      return;
+    }
+
+    try {
+      const dbOrders = this.orderDB.getAllPendingOrders();
+      if (dbOrders.length === 0) return;
+      
+      // Get ALL pending orders from MT5 once to minimize API calls
+      // If this fails, it will throw and we will skip the sync (SAFE)
+      const mt5Orders = await this.connector.getPendingOrders();
+      
+      for (const dbOrder of dbOrders) {
+        const symbol = dbOrder.symbol;
+        
+        // Check if this order still exists in MT5
+        const existsInMT5 = mt5Orders?.some(o => o.ticket === dbOrder.ticket);
+        
+        // Also check if position was opened (order filled)
+        // We can't easily get ALL positions efficiently if there are many, so check per symbol if needed
+        // But for safety, if we can't find it in pending, we should check positions
+        let hasPosition = false;
+        if (!existsInMT5) {
+           const positions = await this.connector.getOpenPositions(symbol);
+           hasPosition = positions && positions.length > 0;
+        }
+        
+        // Debug logging
+        if (!existsInMT5 && !hasPosition) {
+           // ... existing logic ...
+        }
+        
+        if (!existsInMT5 && !hasPosition) {
+          // Order was manually cancelled - clean up
+          const orderAge = (Date.now() - new Date(dbOrder.placedAt).getTime()) / 1000;
+          const botUptime = (Date.now() - this.startTime) / 1000;
+          
+          // Only clean up if:
+          // 1. Order is old enough (give MT5 time to sync) - at least 30 seconds since placed
+          // 2. AND bot has been running long enough (at least 30 seconds) to trust API responses
+          // The bot uptime check is critical for recovered orders that are hours old
+          if (orderAge > 30 && botUptime > 30) {
+            warn('SYNC', `${symbol} order ${dbOrder.ticket} no longer in MT5 - removing from DB`, {
+              age: `${orderAge.toFixed(0)}s`,
+              uptime: `${botUptime.toFixed(0)}s`
+            });
+            this.orderDB.removePendingOrder(symbol, 'manually_cancelled');
+            this.markOrderCancelled(symbol);  // CRITICAL: Prevent immediate re-placement loop
+            
+            // Also clean up the setup if it's tied to this order
+            const setup = this.pendingSetups.get(symbol);
+            if (setup && setup.pendingOrderTicket === dbOrder.ticket) {
+              this.pendingSetups.delete(symbol);
+              await this.sendSetupToAPI(symbol, null);
+            }
+          } else {
+            info('SYNC', `${symbol} order ${dbOrder.ticket} not in MT5 but waiting (Age: ${orderAge.toFixed(0)}s, Uptime: ${botUptime.toFixed(0)}s)`, {});
+          }
+        }
+      }
+    } catch (err: any) {
+      warn('SYNC', `Error syncing with MT5: ${err.message} - SKIPPING SYNC to protect DB`);
+    }
+  }
+
+  /**
+   * Monitor pending orders - check if they got filled, need cancellation due to invalidation, or missed
+   * Also synchronizes with MT5 to detect manually cancelled orders
+   */
+  /**
+   * Monitor pending orders - check if they got filled, need cancellation due to invalidation, or missed
+   * Also synchronizes with MT5 to detect manually cancelled orders
+   */
+  private async monitorPendingOrders(): Promise<void> {
+    // FIRST: Synchronize database with MT5 - clean up any orders that were manually deleted
+    await this.syncDatabaseWithMT5();
+    
+    for (const symbol of this.config.symbols) {
+      try {
+        const setup = this.pendingSetups.get(symbol);
+        if (!setup || setup.status !== 'pending_order' || !setup.pendingOrderTicket) {
+          continue;
+        }
+        
+        // Check if the pending order still exists
+        const pendingOrders = await this.connector.getPendingOrders(symbol);
+        const ourOrder = pendingOrders?.find(o => o.ticket === setup.pendingOrderTicket);
+        
+        // Debug logging
+        if (pendingOrders && pendingOrders.length > 0) {
+          info('PENDING_CHECK', `${symbol} found ${pendingOrders.length} pending orders`, {
+            ourTicket: setup.pendingOrderTicket,
+            foundTickets: pendingOrders.map(o => o.ticket).join(', ')
+          });
+        }
+        
+        // Check if we now have an open position (order got filled!)
+        const openPositions = await this.connector.getOpenPositions(symbol);
+        const hasPosition = openPositions && openPositions.length > 0;
+        
+        if (hasPosition) {
+          // Order was filled! Track the trade
+          const position = openPositions[0];
+          info('PENDING_FILLED', `${symbol} pending order FILLED!`, {
+            ticket: setup.pendingOrderTicket,
+            orderType: setup.pendingOrderType,
+            entry: position.price_open
+          });
+          
+          // Remove from persistent database
+          this.orderDB.removePendingOrder(symbol, 'filled');
+          
+          // Add to triggered trades database
+          this.orderDB.addTriggeredTrade({
+            ticket: position.ticket,
+            originalOrderTicket: setup.pendingOrderTicket,
+            symbol,
+            type: 'MARKET',
+            side: setup.side,
+            entryPrice: position.price_open,
+            sl: position.sl || setup.sl || 0,
+            tp: position.tp || setup.tp || 0,
+            volume: position.volume,
+            placedAt: setup.pendingOrderPlacedAt?.toISOString() || new Date().toISOString(),
+            triggeredAt: new Date().toISOString(),
+            setupType: setup.setupType,
+            status: 'open'
+          });
+          
+          // Mark level as used
+          this.markLevelUsed(symbol, setup.sweepLevel, setup.side);
+          
+          // Track as open trade
+          this.openTrades.set(symbol, {
+            ticket: position.ticket,
+            symbol,
+            side: setup.side,
+            entry: position.price_open,
+            sl: position.sl || setup.sl || 0,
+            tp: position.tp || setup.tp || 0,
+            openTime: new Date()
+          });
+          
+          // Increment trade count
+          this.incrementTradeCount(symbol);
+          
+          // Clear setup
+          this.pendingSetups.delete(symbol);
+          
+          // Send trade to dashboard
+          await this.sendTradeToAPI({
+            symbol,
+            side: setup.side,
+            entry: position.price_open,
+            sl: position.sl || setup.sl || 0,
+            tp: position.tp || setup.tp || 0,
+            volume: position.volume,
+            ticket: position.ticket
+          });
+          continue;
+        }
+        
+        if (!ourOrder) {
+          // Order no longer exists and no position - it was cancelled or rejected
+          
+          // SAFETY CHECK: If OrderDB still has it, it means syncDatabaseWithMT5 found it (or failed safely).
+          // In that case, this might be a temporary glitch with getPendingOrders(symbol).
+          // Trust OrderDB over a single API call failure to prevent "Loop of Death".
+          if (this.orderDB.hasPendingOrder(symbol)) {
+             const dbOrder = this.orderDB.getPendingOrder(symbol);
+             if (dbOrder && dbOrder.ticket === setup.pendingOrderTicket) {
+                 info('PENDING_WARN', `${symbol} order missing from getPendingOrders but exists in DB - assuming API glitch`, {
+                     ticket: setup.pendingOrderTicket
+                 });
+                 continue; // Skip deletion, assume it exists
+             }
+          }
+
+          // BUT: Skip if order was just placed (give MT5 time to register it)
+          const orderAge = setup.pendingOrderPlacedAt 
+            ? (Date.now() - setup.pendingOrderPlacedAt.getTime()) / 1000
+            : 999;
+          
+          // Also skip if bot just started (grace period for API connection)
+          // This is critical for recovered orders that are hours old but bot just started
+          const botUptime = (Date.now() - this.startTime) / 1000;
+
+          if (orderAge < 10 || botUptime < 30) {
+            // Order just placed or bot just started, give it time
+            info('PENDING', `${symbol} order missing but waiting (Age: ${orderAge.toFixed(0)}s, Uptime: ${botUptime.toFixed(0)}s)`, {});
+            continue;
+          }
+          
+          info('PENDING_CANCELLED', `${symbol} pending order no longer exists`, {
+            ticket: setup.pendingOrderTicket
+          });
+          // Remove from database and START CANCEL COOLDOWN to prevent loop
+          this.orderDB.removePendingOrder(symbol, 'cancelled');
+          this.markOrderCancelled(symbol);  // CRITICAL: Prevent immediate re-placement
+          this.pendingSetups.delete(symbol);
+          await this.sendSetupToAPI(symbol, null);
+          continue;
+        }
+        
+        // Order still pending - check for invalidation
+        const tick = await this.connector.getTick(symbol);
+        if (!tick) continue;
+        
+        const currentPrice = setup.side === 'BUY' ? tick.ask : tick.bid;
+        const isXAU = isXAUSymbol(symbol);
+        const isJPY = isJPYSymbol(symbol);
+        const pipSize = getPipSize(symbol);
+        
+        // Check if SL has been hit (should cancel order)
+        if (setup.sl) {
+          const slHit = setup.side === 'BUY' 
+            ? currentPrice <= setup.sl
+            : currentPrice >= setup.sl;
+          
+          if (slHit) {
+            warn('PENDING_INVALIDATED', `${symbol} pending order INVALIDATED - price hit SL level`, {
+              sl: setup.sl,
+              current: currentPrice
+            });
+            
+            // Cancel the pending order
+            await this.cancelPendingOrder(symbol, setup.pendingOrderTicket);
+            // Remove from database and start cancel cooldown
+            this.orderDB.removePendingOrder(symbol, 'invalidated_sl');
+            this.markOrderCancelled(symbol);  // CRITICAL: Prevent immediate re-placement
+            this.pendingSetups.delete(symbol);
+            await this.sendSetupToAPI(symbol, null);
+            continue;
+          }
+        }
+        
+        // Check if order has been pending too long (60 mins max - allow time for consolidation)
+        const orderAge = setup.pendingOrderPlacedAt 
+          ? (Date.now() - setup.pendingOrderPlacedAt.getTime()) / (1000 * 60)
+          : 0;
+        
+        if (orderAge > 60) {
+          warn('PENDING_EXPIRED', `${symbol} pending order EXPIRED - ${orderAge.toFixed(0)} mins old`, {
+            ticket: setup.pendingOrderTicket
+          });
+          
+          await this.cancelPendingOrder(symbol, setup.pendingOrderTicket);
+          // Remove from database and start cancel cooldown
+          this.orderDB.removePendingOrder(symbol, 'expired');
+          this.markOrderCancelled(symbol);  // CRITICAL: Prevent immediate re-placement
+          this.pendingSetups.delete(symbol);
+          await this.sendSetupToAPI(symbol, null);
+          continue;
+        }
+        
+        // Check if price moved too far past entry in the WRONG direction (ran away without filling)
+        // For BUY LIMIT: entry is below current price, only "missed" if price dropped FAR BELOW entry
+        // For SELL LIMIT: entry is above current price, only "missed" if price rallied FAR ABOVE entry
+        if (setup.entryPrice) {
+          let missedPips = 0;
+          let isMissed = false;
+          
+          if (setup.side === 'BUY') {
+            // BUY LIMIT: missed if price dropped way below entry (ran away downward)
+            if (currentPrice < setup.entryPrice) {
+              missedPips = (setup.entryPrice - currentPrice) / pipSize;
+              isMissed = missedPips > (isXAU ? 50 : 30);
+            }
+          } else {
+            // SELL LIMIT: missed if price rallied way above entry (ran away upward)
+            if (currentPrice > setup.entryPrice) {
+              missedPips = (currentPrice - setup.entryPrice) / pipSize;
+              isMissed = missedPips > (isXAU ? 50 : 30);
+            }
+          }
+          
+          if (isMissed) {
+            warn('PENDING_MISSED', `${symbol} pending order MISSED - price ${missedPips.toFixed(1)} pips past entry (ran away)`, {
+              entry: setup.entryPrice,
+              current: currentPrice,
+              side: setup.side
+            });
+            
+            await this.cancelPendingOrder(symbol, setup.pendingOrderTicket);
+            // Remove from database and start cancel cooldown
+            this.orderDB.removePendingOrder(symbol, 'missed');
+            this.markOrderCancelled(symbol);  // CRITICAL: Prevent immediate re-placement
+            this.pendingSetups.delete(symbol);
+            await this.sendSetupToAPI(symbol, null);
+            continue;
+          }
+        }
+        
+        // Order still valid - send update to dashboard with current price
+        await this.sendSetupToAPI(symbol, setup, currentPrice);
+        
+      } catch (err: any) {
+        // Silent - don't spam logs
+      }
+    }
+  }
+
+  /**
+   * Cancel a pending order
+   */
+  private async cancelPendingOrder(symbol: string, ticket: number): Promise<void> {
+    try {
+      await this.connector.cancelOrder(ticket);
+      info('ORDER', `Cancelled pending order ${ticket} for ${symbol}`);
+    } catch (err: any) {
+      warn('ORDER', `Failed to cancel order ${ticket}: ${err.message}`);
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // MARKET HOURS & ROLLOVER MANAGEMENT
+  // ═══════════════════════════════════════════════════════════════════
+
+  /**
+   * Check if market is closed (weekend)
+   * Weekend: Friday 21:00 UTC to Sunday 21:00 UTC
+   */
+  private isMarketClosed(now: Date = new Date()): boolean {
+    const day = now.getUTCDay();  // 0=Sunday, 5=Friday, 6=Saturday
+    const hour = now.getUTCHours();
+    
+    // Saturday: always closed
+    if (day === 6) return true;
+    
+    // Sunday: closed until 21:00 UTC
+    if (day === 0 && hour < this.WEEKEND_OPEN_HOUR) return true;
+    
+    // Friday: closed after 21:00 UTC
+    if (day === 5 && hour >= this.WEEKEND_CLOSE_HOUR) return true;
+    
+    return false;
+  }
+
+  /**
+   * Check if we're in the daily rollover period
+   * Rollover: 21:00-22:00 UTC (10pm-11pm UTC+1)
+   */
+  private isRolloverPeriod(now: Date = new Date()): boolean {
+    const hour = now.getUTCHours();
+    return hour >= this.ROLLOVER_START_UTC && hour < this.ROLLOVER_END_UTC;
+  }
+
+  /**
+   * Check if we're approaching rollover (within 15 minutes)
+   * Used to cancel pending orders before rollover starts
+   */
+  private isApproachingRollover(now: Date = new Date()): boolean {
+    const hour = now.getUTCHours();
+    const minute = now.getUTCMinutes();
+    
+    // 15 minutes before rollover (20:45 UTC)
+    if (hour === this.ROLLOVER_START_UTC - 1 && minute >= 45) return true;
+    
+    // Also true if already in rollover
+    return this.isRolloverPeriod(now);
+  }
+
+  /**
+   * Check if we're approaching weekend close (within 15 minutes)
+   */
+  private isApproachingWeekendClose(now: Date = new Date()): boolean {
+    const day = now.getUTCDay();
+    const hour = now.getUTCHours();
+    const minute = now.getUTCMinutes();
+    
+    // Friday, 15 minutes before close (20:45 UTC)
+    if (day === 5 && hour === this.WEEKEND_CLOSE_HOUR - 1 && minute >= 45) return true;
+    
+    // Also true if market already closed
+    return this.isMarketClosed(now);
+  }
+
+  /**
+   * Cancel all pending orders before rollover/weekend
+   * This prevents getting filled during bad conditions (spread widening, gaps)
+   */
+  private async cancelAllPendingOrdersForRollover(reason: string): Promise<void> {
+    const today = new Date().toISOString().split('T')[0];
+    
+    // Only cancel once per day for rollover
+    if (reason === 'rollover' && this.lastRolloverCancelDate === today && this.rolloverCancelledToday) {
+      return;  // Already cancelled today
+    }
+    
+    const pendingOrders = this.orderDB.getAllPendingOrders();
+    if (pendingOrders.length === 0) {
+      info('ROLLOVER', `No pending orders to cancel for ${reason}`);
+      return;
+    }
+    
+    info('ROLLOVER', `Cancelling ${pendingOrders.length} pending orders before ${reason}...`);
+    
+    for (const order of pendingOrders) {
+      try {
+        await this.cancelPendingOrder(order.symbol, order.ticket);
+        this.orderDB.removePendingOrder(order.symbol, `cancelled_${reason}`);
+        this.pendingSetups.delete(order.symbol);
+        await this.sendSetupToAPI(order.symbol, null);
+        
+        info('ROLLOVER', `Cancelled ${order.symbol} ${order.type} order #${order.ticket} for ${reason}`);
+      } catch (err: any) {
+        warn('ROLLOVER', `Failed to cancel ${order.symbol} order: ${err.message}`);
+      }
+    }
+    
+    // Mark as done for today (only for rollover, not weekend)
+    if (reason === 'rollover') {
+      this.rolloverCancelledToday = true;
+      this.lastRolloverCancelDate = today;
+    }
+  }
+
+  /**
+   * Reset rollover cancel flag at start of new day
+   */
+  private resetRolloverFlagIfNeeded(now: Date): void {
+    const today = now.toISOString().split('T')[0];
+    if (today !== this.lastRolloverCancelDate) {
+      this.rolloverCancelledToday = false;
     }
   }
 
@@ -490,8 +1178,9 @@ export class SweepFVGStrategy {
     now: Date, 
     activeSessions: SessionName[]
   ): Promise<void> {
-    // Check trade limits
-    if (!this.canTrade(symbol)) {
+    // Skip if this symbol has an open trade (let monitorOpenTrades handle it)
+    if (this.openTrades.has(symbol)) {
+      // Trade is running - don't look for new setups
       return;
     }
     
@@ -523,18 +1212,65 @@ export class SweepFVGStrategy {
     const pending = this.pendingSetups.get(symbol);
     
     if (pending) {
-      // Process existing setup and send update to dashboard
+      // Process existing setup
       await this.processPendingSetup(symbol, pending, candles, currentPrice);
-      await this.sendSetupToAPI(symbol, pending, currentPrice);
+      
+      // Only send update to dashboard if NOT a pending_order
+      // (pending_order updates are handled by monitorPendingOrders to avoid double-updates causing flicker)
+      if (pending.status !== 'pending_order') {
+        await this.sendSetupToAPI(symbol, pending, currentPrice);
+      }
     } else {
+      // No pending setup in memory - but check if there's one in the database
+      // This handles edge cases where pendingSetups got cleared but orderDB still has the order
+      if (this.orderDB.hasPendingOrder(symbol)) {
+        const dbOrder = this.orderDB.getPendingOrder(symbol);
+        if (dbOrder) {
+          // Recreate the setup from the database order
+          const recoveredSetup: PendingSetup = {
+            symbol: dbOrder.symbol,
+            side: dbOrder.side as 'BUY' | 'SELL',
+            sweepLevel: dbOrder.entryPrice,
+            sweepTime: new Date(dbOrder.placedAt),
+            sweepSession: 'london',
+            fvg: null,
+            candlesSinceSweep: 0,
+            lastCandleTime: 0,
+            entryPrice: dbOrder.entryPrice,
+            sl: dbOrder.sl,
+            tp: dbOrder.tp,
+            status: 'pending_order',
+            setupType: dbOrder.setupType as any || 'reversal',
+            pendingOrderTicket: dbOrder.ticket,
+            pendingOrderType: dbOrder.type,
+            pendingOrderPlacedAt: new Date(dbOrder.placedAt)
+          };
+          this.pendingSetups.set(symbol, recoveredSetup);
+          await this.sendSetupToAPI(symbol, recoveredSetup, currentPrice);
+          return;
+        }
+      }
+      
+      // Check if we can look for NEW setups (trade limits, cooldowns, etc.)
+      if (!this.canTrade(symbol)) {
+        // Can't trade - send scanning status
+        await this.sendSetupToAPI(symbol, null, currentPrice);
+        return;
+      }
+      
       // Check trading mode for this symbol
       const mode = this.getTradingMode(symbol);
       const isXAU = symbol.includes('XAU');
-      const pipSize = isXAU ? 0.1 : 0.0001;
+      const pipSize = getPipSize(symbol);
       
       if (mode === 'sweep') {
         // SWEEP MODE: Look for session level sweeps
         await this.lookForSweep(symbol, candles, activeSessions);
+        
+        // Also check for Double/Triple Top/Bottom patterns when momentum is fading
+        if (!this.pendingSetups.has(symbol) && isMomentumFading(candles)) {
+          await this.lookForReversalPattern(symbol, candles, currentPrice);
+        }
       } else {
         // TREND MODE: Look for trend continuation entries
         await this.lookForTrendEntry(symbol, candles, currentPrice, isXAU, pipSize);
@@ -556,7 +1292,7 @@ export class SweepFVGStrategy {
     activeSessions: SessionName[]
   ): Promise<void> {
     const isXAU = symbol.includes('XAU');
-    const pipSize = isXAU ? 0.1 : 0.0001;
+    const pipSize = getPipSize(symbol);
     const minSweepPips = isXAU ? this.config.xau.minSweepPips : this.config.fx.minSweepPips;
     
     // Check each active session for sweeps
@@ -583,6 +1319,14 @@ export class SweepFVGStrategy {
         const sweepPips = (currentPrice - prevLevels.high) / pipSize;
         
         if (sweepPips >= minSweepPips) {
+          // Check if this level was recently used
+          if (this.isLevelRecentlyUsed(symbol, prevLevels.high, 'SELL', pipSize)) {
+            info('SWEEP', `${symbol} swept ${session} high but level recently used - skipping`, {
+              level: prevLevels.high
+            });
+            continue;
+          }
+          
           // High swept = look for SELL
           info('SWEEP', `${symbol} swept ${session} high`, {
             level: prevLevels.high,
@@ -600,6 +1344,14 @@ export class SweepFVGStrategy {
         const sweepPips = (prevLevels.low - currentPrice) / pipSize;
         
         if (sweepPips >= minSweepPips) {
+          // Check if this level was recently used
+          if (this.isLevelRecentlyUsed(symbol, prevLevels.low, 'BUY', pipSize)) {
+            info('SWEEP', `${symbol} swept ${session} low but level recently used - skipping`, {
+              level: prevLevels.low
+            });
+            continue;
+          }
+          
           // Low swept = look for BUY
           info('SWEEP', `${symbol} swept ${session} low`, {
             level: prevLevels.low,
@@ -611,6 +1363,141 @@ export class SweepFVGStrategy {
           return;
         }
       }
+    }
+  }
+  
+  /**
+   * Check if a sweep level was recently used (within cooldown period)
+   */
+  private isLevelRecentlyUsed(symbol: string, level: number, side: 'BUY' | 'SELL', pipSize: number): boolean {
+    const recent = this.recentlyUsedLevels.get(symbol);
+    if (!recent) return false;
+    
+    const minutesSinceUsed = (Date.now() - recent.time) / (1000 * 60);
+    if (minutesSinceUsed >= this.LEVEL_COOLDOWN_MINUTES) {
+      // Expired
+      this.recentlyUsedLevels.delete(symbol);
+      return false;
+    }
+    
+    // Check if same side and level is within 20 pips
+    const isXAU = isXAUSymbol(symbol);
+    const levelTolerance = isXAU ? 20.0 : 0.0020;  // 20 pips / $2
+    const levelMatch = Math.abs(level - recent.level) <= levelTolerance;
+    const sideMatch = recent.side === side;
+    
+    return levelMatch && sideMatch;
+  }
+  
+  /**
+   * Mark a sweep level as used
+   */
+  private markLevelUsed(symbol: string, level: number, side: 'BUY' | 'SELL'): void {
+    this.recentlyUsedLevels.set(symbol, {
+      level,
+      side,
+      time: Date.now()
+    });
+    info('LEVEL', `${symbol} marked level ${level.toFixed(5)} as used for ${side}`, {});
+    
+    // Persist to file so it survives restarts
+    this.saveUsedLevels();
+  }
+  
+  /**
+   * Save used levels to file for persistence across restarts
+   */
+  private saveUsedLevels(): void {
+    try {
+      const data: Record<string, { level: number; time: number; side: string }> = {};
+      this.recentlyUsedLevels.forEach((value, key) => {
+        data[key] = value;
+      });
+      fs.writeFileSync(this.LEVELS_FILE, JSON.stringify(data, null, 2));
+    } catch (err) {
+      warn('LEVEL', `Failed to save used levels: ${err}`);
+    }
+  }
+  
+  /**
+   * Load used levels from file on startup
+   */
+  private loadUsedLevels(): void {
+    try {
+      if (fs.existsSync(this.LEVELS_FILE)) {
+        const data = JSON.parse(fs.readFileSync(this.LEVELS_FILE, 'utf-8'));
+        const now = Date.now();
+        let loaded = 0;
+        let expired = 0;
+        
+        for (const [symbol, value] of Object.entries(data)) {
+          const entry = value as { level: number; time: number; side: 'BUY' | 'SELL' };
+          const minutesSinceUsed = (now - entry.time) / (1000 * 60);
+          
+          // Only load if not expired
+          if (minutesSinceUsed < this.LEVEL_COOLDOWN_MINUTES) {
+            this.recentlyUsedLevels.set(symbol, entry);
+            loaded++;
+            info('LEVEL', `Restored ${symbol} level ${entry.level.toFixed(5)} (${entry.side}) - ${minutesSinceUsed.toFixed(0)}m ago`, {});
+          } else {
+            expired++;
+          }
+        }
+        
+        if (loaded > 0 || expired > 0) {
+          info('LEVEL', `Loaded ${loaded} used levels, ${expired} expired`, {});
+        }
+      }
+    } catch (err) {
+      warn('LEVEL', `Failed to load used levels: ${err}`);
+    }
+  }
+
+  // Recover pending orders from JSON database (survives restarts)
+  private async recoverPendingOrders(): Promise<void> {
+    try {
+      // Clean up any stale orders first
+      this.orderDB.cleanupStale();
+      
+      // Get all pending orders and recreate setups for them
+      for (const symbol of this.config.symbols) {
+        const pendingOrders = this.orderDB.getSymbolPendingOrders(symbol);
+        
+        for (const order of pendingOrders) {
+          // Create a pending setup for this order
+          const side = order.side as 'BUY' | 'SELL';
+          const setup: PendingSetup = {
+            symbol: order.symbol,
+            side,
+            sweepLevel: order.entryPrice,
+            sweepTime: new Date(order.placedAt),
+            sweepSession: 'london', // Default
+            fvg: null,
+            candlesSinceSweep: 0,
+            lastCandleTime: 0,
+            entryPrice: order.entryPrice,
+            sl: order.sl,
+            tp: order.tp,
+            status: 'pending_order',
+            setupType: order.setupType as any || 'reversal',
+            pendingOrderTicket: order.ticket,
+            pendingOrderType: order.type,
+            pendingOrderPlacedAt: new Date(order.placedAt)
+          };
+          
+          this.pendingSetups.set(symbol, setup);
+          info('RECOVERY', `Restored pending order for ${symbol}`, {
+            ticket: order.ticket,
+            type: order.type,
+            entry: order.entryPrice
+          });
+          
+          // CRITICAL: Send recovered setup to frontend API immediately
+          await this.sendSetupToAPI(symbol, setup, order.entryPrice);
+        }
+      }
+    } catch (err) {
+      warn('RECOVERY', `Failed to recover pending orders: ${err}`);
     }
   }
 
@@ -659,11 +1546,57 @@ export class SweepFVGStrategy {
     candles: Candle[],
     currentPrice: number
   ): Promise<void> {
+    const isXAU = isXAUSymbol(symbol);
+    const isJPY = isJPYSymbol(symbol);
+    const pipSize = getPipSize(symbol);
+    
+    // If pending order is placed, skip processing - monitorPendingOrders handles it
+    if (setup.status === 'pending_order') {
+      // Just return - the monitorPendingOrders function handles pending orders
+      return;
+    }
+    
+    // CRITICAL: Also check if there's a pending order in the database
+    // This handles cases where the setup status wasn't updated but order exists
+    if (this.orderDB.hasPendingOrder(symbol)) {
+      const dbOrder = this.orderDB.getPendingOrder(symbol);
+      if (dbOrder) {
+        info('PROCESS', `${symbol} has pending order in DB - syncing setup`, {
+          ticket: dbOrder.ticket,
+          currentStatus: setup.status
+        });
+        // Sync the setup with the database order
+        setup.pendingOrderTicket = dbOrder.ticket;
+        setup.pendingOrderType = dbOrder.type;
+        setup.pendingOrderPlacedAt = new Date(dbOrder.placedAt);
+        setup.status = 'pending_order';
+        return;  // Let monitorPendingOrders handle it
+      }
+    }
+    
+    // Check for invalidation FIRST before any processing
+    const invalidReason = this.checkInvalidation(setup, currentPrice, isXAU, isJPY, pipSize);
+    if (invalidReason) {
+      warn('INVALIDATED', `${symbol} setup invalidated: ${invalidReason}`, {
+        side: setup.side,
+        status: setup.status,
+        age: setup.candlesSinceSweep,
+        entry: setup.entryPrice?.toFixed(isXAU ? 2 : 5),
+        sl: setup.sl?.toFixed(isXAU ? 2 : 5),
+        current: currentPrice.toFixed(isXAU ? 2 : 5)
+      });
+      this.pendingSetups.delete(symbol);
+      return;
+    }
+    
     // Only increment candle count when we see a NEW candle (different time)
     const currentCandleTime = candles[candles.length - 1].time;
     if (currentCandleTime !== setup.lastCandleTime) {
       setup.candlesSinceSweep++;
       setup.lastCandleTime = currentCandleTime;
+      info('CANDLE', `${symbol} new candle - candlesSinceSweep: ${setup.candlesSinceSweep}`, {
+        candleTime: new Date(currentCandleTime).toISOString()
+      });
     }
     
     // Track price extremes after sweep for continuation detection
@@ -672,8 +1605,6 @@ export class SweepFVGStrategy {
     setup.highestAfterSweep = Math.max(setup.highestAfterSweep, currentPrice);
     setup.lowestAfterSweep = Math.min(setup.lowestAfterSweep, currentPrice);
     
-    const isXAU = symbol.includes('XAU');
-    const pipSize = isXAU ? 0.1 : 0.0001;
     const config = isXAU ? this.config.xau : this.config.fx;
     
     // Step 1: Look for FVG if we don't have one (reversal setup)
@@ -703,8 +1634,21 @@ export class SweepFVGStrategy {
           fvgLow: validFVG.low,
           entry: setup.entryPrice,
           sl: setup.sl,
-          tp: setup.tp
+          tp: setup.tp,
+          currentPrice
         });
+        
+        // IMMEDIATELY place pending order now that we have entry/sl/tp
+        // The order type (limit/stop/market) will be determined by current price
+        if (setup.entryPrice && setup.sl && setup.tp) {
+          info('FVG', `${symbol} placing pending order for reversal setup`, {
+            entry: setup.entryPrice,
+            current: currentPrice
+          });
+          await this.executeEntry(setup);
+          this.failedSweepAttempts.set(symbol, 0);
+          return;
+        }
       } else {
         // No reversal FVG - check for CONTINUATION pattern
         // If price continues strongly in sweep direction, look for continuation entry
@@ -722,8 +1666,20 @@ export class SweepFVGStrategy {
             newSide: setup.side === 'BUY' ? 'SELL' : 'BUY',  // Flip direction
             entry: setup.entryPrice,
             sl: setup.sl,
-            tp: setup.tp
+            tp: setup.tp,
+            currentPrice
           });
+          
+          // IMMEDIATELY place pending order for continuation
+          if (setup.entryPrice && setup.sl && setup.tp) {
+            info('CONTINUATION', `${symbol} placing pending order for continuation`, {
+              entry: setup.entryPrice,
+              current: currentPrice
+            });
+            await this.executeEntry(setup);
+            this.failedSweepAttempts.set(symbol, 0);
+            return;
+          }
         }
       }
       
@@ -749,17 +1705,135 @@ export class SweepFVGStrategy {
       }
     }
     
-    // Step 2: Check for entry (reversal, continuation, or trend)
-    if ((setup.status === 'waiting_entry' || setup.status === 'continuation' || setup.status === 'trend_entry') && 
+    // Step 2: Execute entry when setup is ready (has entry, SL, TP)
+    // We use pending orders (limit/stop) so we don't need to wait for price
+    if ((setup.status === 'waiting_entry' || setup.status === 'ready' || setup.status === 'continuation' || setup.status === 'trend_entry' || setup.status === 'pattern_entry') && 
         setup.entryPrice && setup.sl && setup.tp) {
-      const shouldEnter = this.checkEntry(setup, currentPrice);
       
-      if (shouldEnter) {
-        await this.executeEntry(setup);
-        // Reset failed attempts on successful entry
-        this.failedSweepAttempts.set(symbol, 0);
+      // First check if we MISSED the entry (price moved too far past in profit direction)
+      const missedEntry = this.checkMissedEntry(setup, currentPrice, isXAU, pipSize);
+      if (missedEntry) {
+        warn('ENTRY', `${symbol} MISSED entry - price moved ${missedEntry.pipsAway.toFixed(1)} pips past entry`, {
+          side: setup.side,
+          entry: setup.entryPrice.toFixed(isXAU ? 2 : 5),
+          current: currentPrice.toFixed(isXAU ? 2 : 5),
+          direction: missedEntry.direction
+        });
+        this.pendingSetups.delete(symbol);
+        return;
+      }
+      
+      // Execute immediately - the order type (market/limit/stop) will be determined
+      // based on current price vs entry price
+      await this.executeEntry(setup);
+      // Reset failed attempts on successful entry
+      this.failedSweepAttempts.set(symbol, 0);
+    }
+  }
+  
+  /**
+   * Check if price has moved too far past the entry level (missed the trade)
+   * Returns null if entry still valid, or info about how far price moved
+   */
+  private checkMissedEntry(
+    setup: PendingSetup, 
+    currentPrice: number, 
+    isXAU: boolean,
+    pipSize: number
+  ): { pipsAway: number; direction: string } | null {
+    if (!setup.entryPrice) return null;
+    
+    const isJPY = isJPYSymbol(setup.symbol);
+    
+    // Miss distance - how far past entry (on the PROFIT side) before we consider it "missed"
+    // This means price went THROUGH our entry and kept going in profit direction
+    // 15 pips for FX, $2.00 for XAU, 15 pips for JPY
+    const maxMissDistance = isXAU ? 20.0 : isJPY ? 0.15 : 0.0015;
+    
+    if (setup.side === 'BUY') {
+      // For BUY LIMIT: entry is BELOW current price (waiting for price to come DOWN)
+      // Price being ABOVE entry is NORMAL - we're still waiting
+      // Only "missed" if price went BELOW entry and is now far BELOW (ran away without filling)
+      // This happens if price dipped to our level but we didn't get filled and it kept dropping
+      if (currentPrice < setup.entryPrice - maxMissDistance) {
+        const pipsAway = (setup.entryPrice - currentPrice) / pipSize;
+        return { pipsAway, direction: 'below (price dropped through entry)' };
+      }
+    } else {
+      // For SELL LIMIT: entry is ABOVE current price (waiting for price to come UP)
+      // Price being BELOW entry is NORMAL - we're still waiting  
+      // Only "missed" if price went ABOVE entry and is now far ABOVE (ran away without filling)
+      // This happens if price rallied to our level but we didn't get filled and it kept rising
+      if (currentPrice > setup.entryPrice + maxMissDistance) {
+        const pipsAway = (currentPrice - setup.entryPrice) / pipSize;
+        return { pipsAway, direction: 'above (price rallied through entry)' };
       }
     }
+    
+    return null;
+  }
+  
+  /**
+   * Check if a setup should be invalidated (remove and start fresh)
+   * Returns the reason string if invalid, null if still valid
+   */
+  private checkInvalidation(
+    setup: PendingSetup,
+    currentPrice: number,
+    isXAU: boolean,
+    isJPY: boolean,
+    pipSize: number
+  ): string | null {
+    // SKIP all invalidation for pending_order status - these are already placed orders
+    // The order itself will be monitored by monitorPendingOrders for SL/expiry
+    if (setup.status === 'pending_order') {
+      return null;  // Never invalidate pending orders through this check
+    }
+    
+    // 1. Price hit SL level (would have been stopped out)
+    if (setup.sl) {
+      if (setup.side === 'BUY' && currentPrice <= setup.sl) {
+        return 'price hit SL level';
+      }
+      if (setup.side === 'SELL' && currentPrice >= setup.sl) {
+        return 'price hit SL level';
+      }
+    }
+    
+    // 2. Setup too old - max 30 minutes (6 M5 candles) waiting for entry
+    const ageMinutes = (Date.now() - setup.sweepTime.getTime()) / (1000 * 60);
+    const maxAgeMinutes = 30;  // 30 min max wait for entry
+    if (setup.status !== 'waiting_fvg' && ageMinutes > maxAgeMinutes) {
+      return `setup too old (${Math.round(ageMinutes)} min)`;
+    }
+    
+    // 3. For waiting_fvg status, max 40 minutes (already has candle-based expiry but add time limit too)
+    if (setup.status === 'waiting_fvg' && ageMinutes > 40) {
+      return `waiting for FVG too long (${Math.round(ageMinutes)} min)`;
+    }
+    
+    // 4. Price moved too far against entry direction (structure broken)
+    // For BUY: if price breaks significantly below sweep level, structure is broken
+    // For SELL: if price breaks significantly above sweep level, structure is broken
+    if (setup.status !== 'waiting_fvg') {
+      const breakThreshold = isXAU ? 20.0 : isJPY ? 0.20 : 0.0020;  // 20 pips
+      
+      if (setup.side === 'BUY') {
+        // If price breaks well below the sweep low, BUY is invalidated
+        if (currentPrice < setup.sweepLevel - breakThreshold) {
+          const pipsBelow = (setup.sweepLevel - currentPrice) / pipSize;
+          return `price broke ${pipsBelow.toFixed(1)} pips below sweep level`;
+        }
+      } else {
+        // If price breaks well above the sweep high, SELL is invalidated
+        if (currentPrice > setup.sweepLevel + breakThreshold) {
+          const pipsAbove = (currentPrice - setup.sweepLevel) / pipSize;
+          return `price broke ${pipsAbove.toFixed(1)} pips above sweep level`;
+        }
+      }
+    }
+    
+    return null;  // Setup is still valid
   }
   
   /**
@@ -780,7 +1854,7 @@ export class SweepFVGStrategy {
     if (!emaFast || !emaSlow) return;
     
     const emaSeparation = Math.abs(emaFast - emaSlow) / pipSize;
-    const minSeparation = isXAU ? 10 : 5; // Minimum EMA separation in pips
+    const minSeparation = isXAU ? 6 : 2; // Minimum EMA separation in pips (reduced from 10/5 - was too strict)
     
     // Determine trend direction
     let trendDirection: 'BUY' | 'SELL' | null = null;
@@ -862,12 +1936,106 @@ export class SweepFVGStrategy {
         sl: setup.sl?.toFixed(5),
         tp: setup.tp?.toFixed(5)
       });
+      
+      // IMMEDIATELY place pending order since setup is ready
+      // Don't wait for next tick - execute now
+      await this.executeEntry(setup);
     } else {
       info('TREND', `${symbol} trend is ${trendDirection} but no FVG for entry yet`, {
         emaFast: emaFast.toFixed(5),
         emaSlow: emaSlow.toFixed(5),
         separation: emaSeparation.toFixed(1)
       });
+    }
+  }
+
+  /**
+   * Look for Double/Triple Top and Bottom reversal patterns
+   * These indicate trend exhaustion and potential reversal
+   */
+  private async lookForReversalPattern(
+    symbol: string,
+    candles: Candle[],
+    currentPrice: number
+  ): Promise<void> {
+    // Detect reversal pattern
+    const pattern = detectReversalPattern(candles, symbol);
+    
+    if (!pattern) return;
+    
+    // Only trade patterns with strength >= 50
+    if (pattern.strength < 50) {
+      info('PATTERN', `${symbol} ${pattern.type} found but strength too low (${pattern.strength})`, {});
+      return;
+    }
+    
+    const isXAU = isXAUSymbol(symbol);
+    const pipSize = getPipSize(symbol);
+    const config = isXAU ? this.config.xau : this.config.fx;
+    
+    // Check if SL is within limits
+    const slDistance = pattern.side === 'BUY' 
+      ? Math.abs(pattern.entryPrice - pattern.sl)
+      : Math.abs(pattern.sl - pattern.entryPrice);
+    const slPips = slDistance / pipSize;
+    
+    if (slPips > config.maxSlPips) {
+      info('PATTERN', `${symbol} ${pattern.type} SL too large (${slPips.toFixed(1)} pips)`, {});
+      return;
+    }
+    
+    // Calculate R:R
+    const tpDistance = Math.abs(pattern.tp - pattern.entryPrice);
+    const rr = tpDistance / slDistance;
+    
+    if (rr < config.minRR) {
+      info('PATTERN', `${symbol} ${pattern.type} R:R too low (${rr.toFixed(1)})`, {});
+      return;
+    }
+    
+    const currentCandleTime = candles[candles.length - 1].time;
+    
+    // Create setup for reversal pattern
+    const setup: PendingSetup = {
+      symbol,
+      side: pattern.side,
+      sweepLevel: pattern.side === 'BUY' ? pattern.patternLow : pattern.patternHigh,
+      sweepTime: new Date(),
+      sweepSession: 'london',
+      fvg: null,
+      reversalPattern: pattern,
+      candlesSinceSweep: pattern.age,
+      lastCandleTime: currentCandleTime,
+      entryPrice: pattern.entryPrice,
+      sl: pattern.sl,
+      tp: pattern.tp,
+      status: pattern.confirmed ? 'pattern_entry' : 'waiting_entry',
+      setupType: pattern.type.toLowerCase().replace('_', '_') as SetupType,
+      failedAttempts: 0
+    };
+    
+    this.pendingSetups.set(symbol, setup);
+    
+    const patternName = pattern.type.replace('_', ' ');
+    info('PATTERN', `${symbol} ${patternName} detected! Strength: ${pattern.strength}`, {
+      side: pattern.side,
+      neckline: pattern.neckline.toFixed(isXAU ? 2 : 5),
+      entry: pattern.entryPrice.toFixed(isXAU ? 2 : 5),
+      sl: pattern.sl.toFixed(isXAU ? 2 : 5),
+      tp: pattern.tp.toFixed(isXAU ? 2 : 5),
+      rr: rr.toFixed(1),
+      confirmed: pattern.confirmed
+    });
+    
+    // IMMEDIATELY place pending order for pattern setup
+    // The order type will be determined based on current price vs entry
+    if (setup.entryPrice && setup.sl && setup.tp) {
+      info('PATTERN', `${symbol} placing pending order for ${patternName}`, {
+        entry: setup.entryPrice,
+        current: currentPrice,
+        confirmed: pattern.confirmed
+      });
+      await this.executeEntry(setup);
     }
   }
   
@@ -1068,44 +2236,73 @@ export class SweepFVGStrategy {
       }
     }
     
-    setup.status = 'ready';
+    setup.status = 'waiting_entry';  // Ready to trigger when price hits entry
   }
 
   private checkEntry(setup: PendingSetup, currentPrice: number): boolean {
     if (!setup.entryPrice) return false;
     
-    const isXAU = setup.symbol.includes('XAU');
-    const pipSize = isXAU ? 0.1 : 0.0001;
-    const tolerance = isXAU ? 0.5 : 0.00005;
+    const symbol = setup.symbol;
+    const isXAU = isXAUSymbol(symbol);
+    const isJPY = isJPYSymbol(symbol);
+    const pipSize = getPipSize(symbol);
+    
+    // Entry tolerance - how far past entry we'll still execute
+    // This catches retests where price touches and bounces
+    // 5 pips for FX, 50 cents for XAU, 5 pips for JPY
+    const entryTolerance = isXAU ? 5.0 : isJPY ? 0.05 : 0.0005;
+    
+    // Max slip - don't enter if we're too far in profit direction already (missed the fill)
+    const maxSlip = isXAU ? 8.0 : isJPY ? 0.08 : 0.0008;  // 8 pips max
     
     if (setup.side === 'BUY') {
-      // Price should come down to entry
+      // For BUY: We want price to come DOWN to entry or slightly past
+      // Entry zone: from (entry - entryTolerance) up to (entry + maxSlip)
+      // So if entry is 1.1000, we enter between 1.0995 and 1.1008
+      
+      const lowerBound = setup.entryPrice - entryTolerance;  // Slightly below entry (touching it)
+      const upperBound = setup.entryPrice + maxSlip;          // Allow some slip above entry
+      
+      const atEntry = currentPrice >= lowerBound && currentPrice <= upperBound;
       const pipsAway = (currentPrice - setup.entryPrice) / pipSize;
       
-      if (pipsAway > 0 && pipsAway < 20) {
-        info('ENTRY', `${setup.symbol} BUY waiting - price ${pipsAway.toFixed(1)} pips above entry`, {
-          current: currentPrice.toFixed(5),
-          entry: setup.entryPrice.toFixed(5),
-          sl: setup.sl?.toFixed(5),
-          tp: setup.tp?.toFixed(5)
+      // Log when close
+      if (Math.abs(pipsAway) <= (isXAU ? 100 : 15)) {
+        info('ENTRY_CHECK', `${setup.symbol} BUY check`, {
+          current: currentPrice.toFixed(isXAU ? 2 : isJPY ? 3 : 5),
+          entry: setup.entryPrice.toFixed(isXAU ? 2 : isJPY ? 3 : 5),
+          pipsAway: pipsAway.toFixed(1),
+          zone: `${lowerBound.toFixed(isXAU ? 2 : 5)} to ${upperBound.toFixed(isXAU ? 2 : 5)}`,
+          atEntry,
+          reason: atEntry ? '✅ IN ZONE - ENTERING!' : (currentPrice > upperBound ? 'ABOVE ZONE - missed' : 'BELOW ZONE - waiting')
         });
       }
       
-      return currentPrice <= setup.entryPrice + tolerance;
+      return atEntry;
     } else {
-      // Price should come up to entry
+      // For SELL: We want price to come UP to entry or slightly past
+      // Entry zone: from (entry - maxSlip) up to (entry + entryTolerance)
+      // So if entry is 1.1000, we enter between 1.0992 and 1.1005
+      
+      const lowerBound = setup.entryPrice - maxSlip;          // Allow some slip below entry
+      const upperBound = setup.entryPrice + entryTolerance;   // Slightly above entry (touching it)
+      
+      const atEntry = currentPrice >= lowerBound && currentPrice <= upperBound;
       const pipsAway = (setup.entryPrice - currentPrice) / pipSize;
       
-      if (pipsAway > 0 && pipsAway < 20) {
-        info('ENTRY', `${setup.symbol} SELL waiting - price ${pipsAway.toFixed(1)} pips below entry`, {
-          current: currentPrice.toFixed(5),
-          entry: setup.entryPrice.toFixed(5),
-          sl: setup.sl?.toFixed(5),
-          tp: setup.tp?.toFixed(5)
+      // Log when close
+      if (Math.abs(pipsAway) <= (isXAU ? 100 : 15)) {
+        info('ENTRY_CHECK', `${setup.symbol} SELL check`, {
+          current: currentPrice.toFixed(isXAU ? 2 : isJPY ? 3 : 5),
+          entry: setup.entryPrice.toFixed(isXAU ? 2 : isJPY ? 3 : 5),
+          pipsAway: pipsAway.toFixed(1),
+          zone: `${lowerBound.toFixed(isXAU ? 2 : 5)} to ${upperBound.toFixed(isXAU ? 2 : 5)}`,
+          atEntry,
+          reason: atEntry ? '✅ IN ZONE - ENTERING!' : (currentPrice < lowerBound ? 'BELOW ZONE - missed' : 'ABOVE ZONE - waiting')
         });
       }
       
-      return currentPrice >= setup.entryPrice - tolerance;
+      return atEntry;
     }
   }
 
@@ -1118,6 +2315,22 @@ export class SweepFVGStrategy {
     
     const { symbol, side, entryPrice, sl, tp } = setup;
     
+    // CRITICAL: Check database first to prevent duplicate orders
+    if (this.orderDB.hasPendingOrder(symbol)) {
+      const existingOrder = this.orderDB.getPendingOrder(symbol);
+      if (existingOrder) {
+        info('ENTRY', `${symbol} already has pending order in DB - syncing setup`, {
+          ticket: existingOrder.ticket
+        });
+        // CRITICAL FIX: Sync setup status with the existing order!
+        setup.pendingOrderTicket = existingOrder.ticket;
+        setup.pendingOrderType = existingOrder.type;
+        setup.pendingOrderPlacedAt = new Date(existingOrder.placedAt);
+        setup.status = 'pending_order';
+      }
+      return;
+    }
+    
     // Check if we already have an open position on this symbol
     const openPositions = await this.connector.getOpenPositions(symbol);
     if (openPositions && openPositions.length > 0) {
@@ -1126,7 +2339,59 @@ export class SweepFVGStrategy {
       return;
     }
     
-    // Check spread
+    // Also check for existing pending orders ON MT5
+    const pendingOrders = await this.connector.getPendingOrders(symbol);
+    if (pendingOrders && pendingOrders.length > 0) {
+      // If this setup already has a pending order, that's fine - just return
+      if (setup.status === 'pending_order' && setup.pendingOrderTicket) {
+        // Our order is already placed, nothing to do
+        return;
+      }
+      
+      // Check if any of these orders match our entry (bot may have placed it previously)
+      const matchingOrder = pendingOrders.find(o => {
+        const priceDiff = Math.abs(o.price_open - entryPrice);
+        const tolerance = isXAUSymbol(symbol) ? 1.0 : isJPYSymbol(symbol) ? 0.05 : 0.0005;
+        return priceDiff <= tolerance;
+      });
+      
+      if (matchingOrder) {
+        // This looks like our order - sync with it
+        info('ENTRY', `${symbol} found matching MT5 pending order - syncing`, {
+          ticket: matchingOrder.ticket,
+          price: matchingOrder.price_open,
+          ourEntry: entryPrice
+        });
+        
+        // Save to database
+        this.orderDB.addPendingOrder({
+          ticket: matchingOrder.ticket,
+          symbol,
+          type: matchingOrder.type_description || setup.pendingOrderType || 'LIMIT',
+          side,
+          entryPrice: matchingOrder.price_open,
+          sl: matchingOrder.sl || sl,
+          tp: matchingOrder.tp || tp,
+          volume: matchingOrder.volume,
+          placedAt: new Date().toISOString(),
+          setupType: setup.setupType
+        });
+        
+        // Update setup
+        setup.pendingOrderTicket = matchingOrder.ticket;
+        setup.pendingOrderType = matchingOrder.type_description || 'LIMIT';
+        setup.pendingOrderPlacedAt = new Date();
+        setup.status = 'pending_order';
+        return;
+      }
+      
+      // Otherwise, there's a conflicting order - don't create another
+      warn('ENTRY', `${symbol} already has ${pendingOrders.length} pending order(s) - skipping`);
+      this.pendingSetups.delete(symbol);
+      return;
+    }
+    
+    // Get current tick for spread check and order type determination
     const tick = await this.connector.getTick(symbol);
     if (!tick) {
       warn('ENTRY', `${symbol} no tick data`);
@@ -1134,76 +2399,176 @@ export class SweepFVGStrategy {
     }
     
     const spread = tick.ask - tick.bid;
-    const isXAU = symbol.includes('XAU');
+    const isXAU = isXAUSymbol(symbol);
+    const isJPY = isJPYSymbol(symbol);
+    const pipSize = getPipSize(symbol);
     const maxSpread = isXAU 
       ? this.config.xau.maxSpreadCents / 100 
-      : this.config.fx.maxSpreadPips * 0.0001;
+      : isJPY 
+        ? this.config.fx.maxSpreadPips * 0.01   // JPY pairs: 0.01 per pip
+        : this.config.fx.maxSpreadPips * 0.0001; // Standard FX: 0.0001 per pip
     
     if (spread > maxSpread) {
       warn('ENTRY', `${symbol} spread too high: ${spread}`, { maxSpread });
       return;
     }
     
+    // Current price for order type determination
+    const currentPrice = side === 'BUY' ? tick.ask : tick.bid;
+    
+    // Determine order type: Market, Limit, or Stop
+    // Tolerance for "at market" execution - VERY tight, only if basically at entry
+    const marketTolerance = isXAU ? 0.5 : isJPY ? 0.02 : 0.0002;  // 5 pips XAU ($0.50), 2 pips JPY, 2 pips FX
+    const orderType = this.orderManager.getOrderType(side, entryPrice, currentPrice, marketTolerance);
+    
     // Get real account balance from MT5
     const accountInfo = await this.connector.getAccountInfo();
-    const balance = accountInfo?.balance ?? 10000; // Fallback to 10k if unavailable
+    const balance = accountInfo?.balance ?? 10000;
     
     if (!accountInfo) {
       warn('ENTRY', `${symbol} could not get account info - using fallback balance`);
     }
     
-    // Calculate volume
-    const slPips = Math.abs(entryPrice - sl) / (isXAU ? 0.1 : 0.0001);
-    const volume = computeVolume(balance, this.config.riskPercent, slPips, symbol);
+    // Calculate volume - pass current price for proper pip value calculation on JPY/USD base pairs
+    const slPips = Math.abs(entryPrice - sl) / pipSize;
+    const volume = computeVolume(balance, this.config.riskPercent, slPips, symbol, currentPrice);
     
-    // Place order
-    info('ENTRY', `Placing ${side} order for ${symbol}`, {
-      entry: entryPrice,
-      sl,
-      tp,
+    info('ENTRY', `Placing ${orderType} for ${symbol}`, {
+      entry: entryPrice.toFixed(isXAU ? 2 : 5),
+      current: currentPrice.toFixed(isXAU ? 2 : 5),
+      sl: sl.toFixed(isXAU ? 2 : 5),
+      tp: tp.toFixed(isXAU ? 2 : 5),
       volume,
-      slPips: slPips.toFixed(1)
+      slPips: slPips.toFixed(1),
+      orderType,
+      balance: balance.toFixed(2),
+      riskPercent: this.config.riskPercent
     });
     
     try {
-      const result = await this.orderManager.placeMarketOrder({
-        symbol,
-        type: side,
-        volume,
-        sl,
-        tp,
-        comment: `SweepFVG_${setup.sweepSession}`
-      });
+      let result;
       
-      if (result && result.ticket) {
-        info('TRADE', `${symbol} ${side} opened`, {
-          ticket: result.ticket,
-          entry: result.price,
+      if (orderType === 'BUY' || orderType === 'SELL') {
+        // Execute at market immediately
+        result = await this.orderManager.placeMarketOrder({
+          symbol,
+          type: side,
+          volume,
+          sl,
+          tp,
+          comment: `SweepFVG_${setup.setupType}`
+        });
+        
+        if (result && result.ticket) {
+          info('TRADE', `${symbol} ${side} MARKET order opened`, {
+            ticket: result.ticket,
+            entry: result.price,
+            sl,
+            tp,
+            volume
+          });
+          
+          // Mark the sweep level as used so we don't re-enter same zone
+          this.markLevelUsed(symbol, setup.sweepLevel, side);
+          
+          // Track open trade for monitoring
+          this.openTrades.set(symbol, {
+            ticket: result.ticket,
+            symbol,
+            side,
+            entry: result.price || entryPrice,
+            sl,
+            tp,
+            openTime: new Date()
+          });
+          
+          // Update trade count
+          this.incrementTradeCount(symbol);
+          
+          // Clear setup since trade is open
+          this.pendingSetups.delete(symbol);
+          
+          // Send to dashboard
+          await this.sendTradeToAPI({
+            symbol,
+            side,
+            entry: result.price || entryPrice,
+            sl,
+            tp,
+            volume,
+            ticket: result.ticket
+          });
+        }
+      } else {
+        // Place pending order (limit or stop)
+        info('ENTRY', `${symbol} attempting to place ${orderType} pending order...`, {
+          entry: entryPrice,
           sl,
           tp,
           volume
         });
         
-        // Update trade count
-        this.incrementTradeCount(symbol);
-        
-        // Send to dashboard
-        await this.sendTradeToAPI({
+        result = await this.orderManager.placePendingOrder({
           symbol,
-          side,
-          entry: result.price || entryPrice,
+          type: orderType,
+          volume,
+          price: entryPrice,
           sl,
           tp,
-          volume,
-          ticket: result.ticket
+          comment: `SweepFVG_${setup.setupType}`
         });
+        
+        info('ENTRY', `${symbol} pending order API response`, {
+          success: result?.success,
+          order: result?.order,
+          deal: result?.deal,
+          ticket: result?.ticket
+        });
+        
+        if (result && result.order) {
+          info('TRADE', `${symbol} ${orderType} pending order placed`, {
+            ticket: result.order,
+            entry: entryPrice,
+            sl,
+            tp,
+            volume
+          });
+          
+          // Save to persistent database FIRST (survives restarts)
+          this.orderDB.addPendingOrder({
+            ticket: result.order,
+            symbol,
+            type: orderType,
+            side,
+            entryPrice,
+            sl,
+            tp,
+            volume,
+            placedAt: new Date().toISOString(),
+            setupType: setup.setupType
+          });
+          
+          // Track pending order in setup - DON'T delete setup yet
+          setup.pendingOrderTicket = result.order;
+          setup.pendingOrderType = orderType;
+          setup.pendingOrderPlacedAt = new Date();
+          setup.status = 'pending_order';
+          
+          // Send updated setup to dashboard
+          await this.sendSetupToAPI(symbol, setup, currentPrice);
+        } else {
+          // Order failed to place - mark setup as failed to prevent infinite retry loop
+          warn('ENTRY', `${symbol} pending order returned no ticket - invalidating setup`, {
+            result: JSON.stringify(result)
+          });
+          this.pendingSetups.delete(symbol);
+        }
       }
     } catch (err: any) {
-      warn('ENTRY', `Failed to open ${symbol}: ${err.message}`);
+      warn('ENTRY', `${symbol} order failed: ${err.message}`);
+      // On exception, also delete setup to prevent infinite retry
+      this.pendingSetups.delete(symbol);
     }
-    
-    // Clear pending setup
-    this.pendingSetups.delete(symbol);
   }
 
   // ═══════════════════════════════════════════════════════════════════
@@ -1228,7 +2593,55 @@ export class SweepFVGStrategy {
       return false;
     }
     
+    // CRITICAL: Check if there's a pending order in the database (survives restarts)
+    // This prevents placing duplicate orders after restart
+    if (this.orderDB.hasPendingOrder(symbol)) {
+      return false;
+    }
+    
+    // Check cooldown - don't re-enter immediately after a trade closes
+    const lastClosedTime = this.recentlyClosedTrades.get(symbol);
+    if (lastClosedTime) {
+      const minutesSinceClosed = (Date.now() - lastClosedTime) / (1000 * 60);
+      if (minutesSinceClosed < this.COOLDOWN_MINUTES) {
+        // Still in cooldown
+        return false;
+      } else {
+        // Cooldown expired, remove from map
+        this.recentlyClosedTrades.delete(symbol);
+      }
+    }
+    
+    // Check cancel cooldown - don't re-place orders immediately after cancellation (prevents loop)
+    const lastCancelledTime = this.recentlyCancelledOrders.get(symbol);
+    if (lastCancelledTime) {
+      const minutesSinceCancelled = (Date.now() - lastCancelledTime) / (1000 * 60);
+      if (minutesSinceCancelled < this.CANCEL_COOLDOWN_MINUTES) {
+        // Still in cancel cooldown - this is the key to breaking the loop
+        return false;
+      } else {
+        // Cooldown expired, remove from map
+        this.recentlyCancelledOrders.delete(symbol);
+      }
+    }
+    
     return true;
+  }
+
+  /**
+   * Mark a symbol as recently closed (start cooldown)
+   */
+  private markTradeClosed(symbol: string): void {
+    this.recentlyClosedTrades.set(symbol, Date.now());
+    info('COOLDOWN', `${symbol} trade closed - cooldown for ${this.COOLDOWN_MINUTES} mins`, {});
+  }
+  
+  /**
+   * Mark a symbol as recently cancelled (start cancel cooldown to prevent loop)
+   */
+  private markOrderCancelled(symbol: string): void {
+    this.recentlyCancelledOrders.set(symbol, Date.now());
+    info('COOLDOWN', `${symbol} order cancelled - cooldown for ${this.CANCEL_COOLDOWN_MINUTES} mins to prevent loop`, {});
   }
 
   private incrementTradeCount(symbol: string): void {
@@ -1262,6 +2675,7 @@ export class SweepFVGStrategy {
                 setup.status === 'waiting_entry' ? 'fvg_formed' : 
                 setup.status === 'continuation' ? 'continuation' :
                 setup.status === 'trend_entry' ? 'trend_entry' :
+                setup.status === 'pending_order' ? 'pending_order' :
                 setup.status === 'ready' ? 'waiting_entry' : 'scanning',
         symbol,
         side: setup.side,
@@ -1279,7 +2693,11 @@ export class SweepFVGStrategy {
         updatedAt: new Date().toISOString(),
         setupType: setup.setupType || 'reversal',
         tradingMode: mode,
-        sweepTimeRemaining: mode === 'sweep' ? sweepTimeRemaining : 0
+        sweepTimeRemaining: mode === 'sweep' ? sweepTimeRemaining : 0,
+        // Pending order info
+        pendingOrderTicket: setup.pendingOrderTicket,
+        pendingOrderType: setup.pendingOrderType,
+        pendingOrderPlacedAt: setup.pendingOrderPlacedAt?.toISOString()
       } : {
         status: 'scanning',
         symbol,
@@ -1320,6 +2738,59 @@ export class SweepFVGStrategy {
       });
     } catch (err) {
       // Silent fail - don't block trading
+    }
+  }
+
+  private async sendTradeCloseToAPI(
+    trade: { ticket: number; symbol: string; side: 'BUY' | 'SELL'; entry: number; sl: number; tp: number; openTime: Date },
+    closePrice: number,
+    pnlPips: number,
+    result: 'win' | 'loss' | 'breakeven'
+  ): Promise<void> {
+    try {
+      await fetch('http://localhost:3001/api/trades/close', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          ticket: trade.ticket,
+          symbol: trade.symbol,
+          side: trade.side,
+          entryPrice: trade.entry,
+          closePrice,
+          pnlPips,
+          result,
+          closeTime: new Date().toISOString(),
+          status: 'closed'
+        })
+      });
+    } catch (err) {
+      // Silent fail
+    }
+  }
+
+  private async sendOpenTradeUpdate(
+    trade: { ticket: number; symbol: string; side: 'BUY' | 'SELL'; entry: number; sl: number; tp: number },
+    currentPrice: number,
+    unrealizedPips: number
+  ): Promise<void> {
+    try {
+      await fetch('http://localhost:3001/api/trades/update', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          ticket: trade.ticket,
+          symbol: trade.symbol,
+          side: trade.side,
+          entryPrice: trade.entry,
+          currentPrice,
+          unrealizedPips,
+          sl: trade.sl,
+          tp: trade.tp,
+          status: 'open'
+        })
+      });
+    } catch (err) {
+      // Silent fail
     }
   }
 

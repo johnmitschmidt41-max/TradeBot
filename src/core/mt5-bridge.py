@@ -48,20 +48,27 @@ def log_dashboard(message, level='info'):
 app = Flask(__name__)
 CORS(app)
 
+# Global error handler to prevent crashes
+@app.errorhandler(Exception)
+def handle_exception(e):
+    print(f"Unhandled exception: {e}")
+    log_dashboard(f"Unhandled exception: {e}", level='error')
+    return jsonify({"error": str(e), "status": "error"}), 500
+
 # Load configuration
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.json")
 
 def load_config():
     """Load account configuration from config.json"""
     if not os.path.exists(CONFIG_PATH):
-        print(f"❌ Config file not found at {CONFIG_PATH}")
+        print(f"Config file not found at {CONFIG_PATH}")
         return None
     
     try:
         with open(CONFIG_PATH, 'r') as f:
             return json.load(f)
     except Exception as e:
-        print(f"❌ Failed to load config: {e}")
+        print(f"Failed to load config: {e}")
         return None
 
 def get_current_mode():
@@ -78,18 +85,18 @@ def get_current_mode():
 
 config = load_config()
 if not config:
-    print("❌ Failed to load configuration, exiting")
+    print("Failed to load configuration, exiting")
     sys.exit(1)
 
 # Get current mode
 CURRENT_MODE = get_current_mode()
-print(f"📋 Current trading mode: {CURRENT_MODE}")
+print(f"Current trading mode: {CURRENT_MODE}")
 log_dashboard(f"Current trading mode: {CURRENT_MODE}")
 
 # Load account info based on current mode
 account_config = config["accounts"].get(CURRENT_MODE)
 if not account_config:
-    print(f"❌ Account configuration not found for mode: {CURRENT_MODE}")
+    print(f"Account configuration not found for mode: {CURRENT_MODE}")
     sys.exit(1)
 
 ACCOUNT = account_config["accountNumber"]
@@ -97,7 +104,7 @@ PASSWORD = account_config["password"]
 SERVER = account_config["server"]
 MT5_PATH = config.get("mt5Path", r"C:\Program Files\MetaTrader 5 EXNESS\terminal64.exe")
 
-print(f"🔐 Logging in to {CURRENT_MODE} account: {ACCOUNT} @ {SERVER}")
+print(f"Logging in to {CURRENT_MODE} account: {ACCOUNT} @ {SERVER}")
 log_dashboard(f"Logging in to {CURRENT_MODE} account: {ACCOUNT} @ {SERVER}")
 
 mt5_initialized = False
@@ -108,48 +115,52 @@ def check_mode_change():
     """Check if trading mode has changed and reconnect if needed"""
     global CURRENT_MODE, ACCOUNT, PASSWORD, SERVER, last_known_mode, mt5_initialized
     
-    new_mode = get_current_mode()
-    if new_mode != last_known_mode:
-        print(f"\n{'='*60}")
-        print(f"🔄 MODE CHANGE DETECTED: {last_known_mode} → {new_mode}")
-        print(f"{'='*60}")
-        last_known_mode = new_mode
+    try:
+        new_mode = get_current_mode()
+        if new_mode != last_known_mode:
+            print(f"\n{'='*60}")
+            print(f"MODE CHANGE DETECTED: {last_known_mode} -> {new_mode}")
+            print(f"{'='*60}")
+            last_known_mode = new_mode
+            
+            # Reload account config for new mode
+            account_config = config["accounts"].get(new_mode)
+            if not account_config:
+                print(f"Account config not found for {new_mode}")
+                return False
+            
+            CURRENT_MODE = new_mode
+            ACCOUNT = account_config["accountNumber"]
+            PASSWORD = account_config["password"]
+            SERVER = account_config["server"]
+            
+            print(f"Current trading mode: {CURRENT_MODE}")
+            print(f"Logging in to {CURRENT_MODE} account: {ACCOUNT} @ {SERVER}")
+            
+            # Disconnect and reconnect
+            if mt5_initialized:
+                try:
+                    mt5.shutdown()
+                    mt5_initialized = False
+                    print("Disconnected from previous account")
+                    time.sleep(1)
+                except Exception as e:
+                    print(f"Error disconnecting: {e}")
+            
+            # Reconnect to new account
+            if init_mt5():
+                print(f"Connected to {CURRENT_MODE} account: {ACCOUNT}")
+                print(f"{'='*60}\n")
+                return True
+            else:
+                print(f"Failed to connect to {CURRENT_MODE} account")
+                print(f"{'='*60}\n")
+                return False
         
-        # Reload account config for new mode
-        account_config = config["accounts"].get(new_mode)
-        if not account_config:
-            print(f"❌ Account config not found for {new_mode}")
-            return False
-        
-        CURRENT_MODE = new_mode
-        ACCOUNT = account_config["accountNumber"]
-        PASSWORD = account_config["password"]
-        SERVER = account_config["server"]
-        
-        print(f"📋 Current trading mode: {CURRENT_MODE}")
-        print(f"🔐 Logging in to {CURRENT_MODE} account: {ACCOUNT} @ {SERVER}")
-        
-        # Disconnect and reconnect
-        if mt5_initialized:
-            try:
-                mt5.shutdown()
-                mt5_initialized = False
-                print("✅ Disconnected from previous account")
-                time.sleep(1)
-            except Exception as e:
-                print(f"⚠️  Error disconnecting: {e}")
-        
-        # Reconnect to new account
-        if init_mt5():
-            print(f"✅ Connected to {CURRENT_MODE} account: {ACCOUNT}")
-            print(f"{'='*60}\n")
-            return True
-        else:
-            print(f"❌ Failed to connect to {CURRENT_MODE} account")
-            print(f"{'='*60}\n")
-            return False
-    
-    return True
+        return True
+    except Exception as e:
+        print(f"Error in check_mode_change: {e}")
+        return False
 
 
 def init_mt5():
@@ -160,7 +171,7 @@ def init_mt5():
 
     if not mt5.initialize(MT5_PATH):
         err = mt5.last_error()
-        print("❌ MT5 initialize() FAILED:", err)
+        print("MT5 initialize() FAILED:", err)
         log_dashboard(f"MT5 initialize FAILED: {err}", level='error')
         return False
 
@@ -168,12 +179,12 @@ def init_mt5():
 
     if not authorized:
         err = mt5.last_error()
-        print("❌ MT5 login FAILED:", err)
+        print("MT5 login FAILED:", err)
         log_dashboard(f"MT5 login FAILED: {err}", level='error')
         return False
 
     acc_info = mt5.account_info()
-    print("✅ MT5 connected:", acc_info)
+    print("MT5 connected:", acc_info)
     log_dashboard(f"MT5 connected: {acc_info}")
     mt5_initialized = True
     return True
@@ -190,16 +201,37 @@ for i in range(5):
 
 @app.route('/health', methods=['GET'])
 def health():
-    # Check for mode changes on every health check
-    check_mode_change()
-    
-    return jsonify({
-        "status": "connected" if mt5_initialized else "disconnected",
-        "trading_mode": CURRENT_MODE,
-        "account": ACCOUNT,
-        "server": SERVER,
-        "terminal_info": mt5.terminal_info()._asdict() if mt5_initialized else None
-    })
+    try:
+        # Check for mode changes on every health check
+        check_mode_change()
+        
+        # Safely get terminal info
+        terminal_info = None
+        if mt5_initialized:
+            try:
+                info = mt5.terminal_info()
+                if info:
+                    terminal_info = info._asdict()
+            except Exception as e:
+                print(f"Error getting terminal info: {e}")
+        
+        return jsonify({
+            "status": "connected" if mt5_initialized else "disconnected",
+            "trading_mode": CURRENT_MODE,
+            "account": ACCOUNT,
+            "server": SERVER,
+            "terminal_info": terminal_info
+        })
+    except Exception as e:
+        print(f"Error in health endpoint: {e}")
+        return jsonify({
+            "status": "error",
+            "trading_mode": CURRENT_MODE,
+            "account": ACCOUNT,
+            "server": SERVER,
+            "terminal_info": None,
+            "error": str(e)
+        })
 
 
 @app.route('/candles', methods=['POST'])
@@ -212,7 +244,7 @@ def candles():
     timeframe = data.get("timeframe", "M15")
     count = data.get("count", 200)
 
-    print(f"📊 Candle request: {symbol} | {timeframe} | {count} bars")
+    print(f"Candle request: {symbol} | {timeframe} | {count} bars")
 
     tf_map = {
         "M1": mt5.TIMEFRAME_M1,
@@ -230,13 +262,13 @@ def candles():
 
     if rates is None:
         error = mt5.last_error()
-        print(f"❌ Failed to fetch {symbol}: {error}")
+        print(f"Failed to fetch {symbol}: {error}")
         return jsonify({
             "error": f"Failed to fetch candles for {symbol}",
             "mt5_error": error
         }), 500
 
-    print(f"✅ Fetched {len(rates)} candles for {symbol}")
+    print(f"Fetched {len(rates)} candles for {symbol}")
 
     candles = []
     for r in rates:
@@ -267,7 +299,7 @@ def get_positions():
             positions = mt5.positions_get()
         
         if positions is None:
-            print(f"⚠️ No positions returned for {symbol if symbol else 'all symbols'}")
+            print(f"No positions returned for {symbol if symbol else 'all symbols'}")
             return jsonify({"positions": []})
         
         pos_list = []
@@ -286,14 +318,14 @@ def get_positions():
         return jsonify({"positions": pos_list})
     
     except Exception as e:
-        print(f"❌ Error fetching positions for {symbol}: {e}")
+        print(f"Error fetching positions for {symbol}: {e}")
         return jsonify({"positions": []}), 500
 
 @app.route('/orders', methods=['GET'])
 def get_orders():
     """Get pending orders"""
     if not mt5_initialized:
-        return jsonify({"orders": []})
+        return jsonify({"error": "MT5 not initialized", "orders": []}), 503
     
     symbol = request.args.get('symbol')
     
@@ -304,26 +336,46 @@ def get_orders():
             orders = mt5.orders_get()
         
         if orders is None:
-            print(f"⚠️ No orders returned for {symbol if symbol else 'all symbols'}")
+            # Check if there was an actual error or just no orders
+            last_error = mt5.last_error()
+            if last_error[0] != mt5.RES_S_OK:
+                print(f"Error fetching orders: {last_error}")
+                return jsonify({"error": f"MT5 Error: {last_error}", "orders": []}), 500
+            
+            # No orders found is not an error
+            # print(f"No orders returned for {symbol if symbol else 'all symbols'}")
             return jsonify({"orders": []})
+        
+        # Map MT5 order types to descriptions
+        order_type_map = {
+            mt5.ORDER_TYPE_BUY_LIMIT: "BUY_LIMIT",
+            mt5.ORDER_TYPE_SELL_LIMIT: "SELL_LIMIT",
+            mt5.ORDER_TYPE_BUY_STOP: "BUY_STOP",
+            mt5.ORDER_TYPE_SELL_STOP: "SELL_STOP",
+            mt5.ORDER_TYPE_BUY_STOP_LIMIT: "BUY_STOP_LIMIT",
+            mt5.ORDER_TYPE_SELL_STOP_LIMIT: "SELL_STOP_LIMIT",
+        }
         
         order_list = []
         for order in orders:
+            order_type_desc = order_type_map.get(order.type, f"UNKNOWN_{order.type}")
             order_list.append({
                 "ticket": order.ticket,
                 "symbol": order.symbol,
                 "type": "BUY" if order.type in [mt5.ORDER_TYPE_BUY_LIMIT, mt5.ORDER_TYPE_BUY_STOP] else "SELL",
-                "volume": order.volume_initial,  # ← FIXED
+                "type_description": order_type_desc,
+                "volume": order.volume_initial,
                 "price_open": order.price_open,
                 "sl": order.sl,
                 "tp": order.tp,
                 "comment": getattr(order, 'comment', None)
             })
+            print(f"Found pending order: {order.symbol} #{order.ticket} {order_type_desc} @ {order.price_open}")
         
         return jsonify({"orders": order_list})
     
     except Exception as e:
-        print(f"❌ Error fetching orders for {symbol}: {e}")
+        print(f"Error fetching orders for {symbol}: {e}")
         return jsonify({"orders": []}), 500
 
 @app.route('/account', methods=['GET'])
@@ -349,24 +401,40 @@ def order():
     sl = float(data['sl'])
     tp = float(data['tp'])
 
-    if price == 0:
+    # Map order types properly
+    # For market orders (price = 0): BUY -> ORDER_TYPE_BUY, SELL -> ORDER_TYPE_SELL
+    # For pending orders: BUY_LIMIT, SELL_LIMIT, BUY_STOP, SELL_STOP
+    
+    if order_type in ['BUY', 'SELL'] and price == 0:
+        # Market order
         type_map = {
             "BUY": mt5.ORDER_TYPE_BUY,
             "SELL": mt5.ORDER_TYPE_SELL
         }
         action = mt5.TRADE_ACTION_DEAL
+        mt5_order_type = type_map[order_type]
     else:
-        type_map = {
+        # Pending order - use explicit type mapping
+        pending_type_map = {
+            "BUY_LIMIT": mt5.ORDER_TYPE_BUY_LIMIT,
+            "SELL_LIMIT": mt5.ORDER_TYPE_SELL_LIMIT,
+            "BUY_STOP": mt5.ORDER_TYPE_BUY_STOP,
+            "SELL_STOP": mt5.ORDER_TYPE_SELL_STOP,
+            # Legacy support: if just BUY/SELL with price, assume limit
             "BUY": mt5.ORDER_TYPE_BUY_LIMIT,
             "SELL": mt5.ORDER_TYPE_SELL_LIMIT
         }
         action = mt5.TRADE_ACTION_PENDING
+        mt5_order_type = pending_type_map.get(order_type)
+        
+        if mt5_order_type is None:
+            return jsonify({"error": f"Unknown order type: {order_type}"}), 400
 
     request_data = {
         "action": action,
         "symbol": symbol,
         "volume": volume,
-        "type": type_map[order_type],
+        "type": mt5_order_type,
         "sl": sl,
         "tp": tp,
         "magic": 889900,
@@ -388,10 +456,48 @@ def order():
             "comment": result.comment
         }), 400
 
+    # Return both order and deal, plus ticket for convenience
+    # For pending orders: order contains the order ticket, deal is 0
+    # For market orders: deal contains the deal ticket, order might be 0
     return jsonify({
         "success": True,
         "order": result.order,
-        "deal": result.deal
+        "deal": result.deal,
+        "ticket": result.order if result.order else result.deal,  # Convenience field
+        "price": result.price,  # Fill price for market orders
+        "volume": result.volume
+    })
+
+
+@app.route('/cancel-order', methods=['POST'])
+def cancel_order():
+    """Cancel a pending order by ticket number."""
+    if not mt5_initialized:
+        return jsonify({"error": "MT5 not connected"}), 500
+
+    data = request.json
+    ticket = data.get('ticket')
+    
+    if not ticket:
+        return jsonify({"error": "Missing ticket parameter"}), 400
+    
+    request_data = {
+        "action": mt5.TRADE_ACTION_REMOVE,
+        "order": ticket
+    }
+    
+    result = mt5.order_send(request_data)
+    
+    if result.retcode != mt5.TRADE_RETCODE_DONE:
+        return jsonify({
+            "error": "Cancel failed",
+            "retcode": result.retcode,
+            "comment": result.comment
+        }), 400
+    
+    return jsonify({
+        "success": True,
+        "ticket": ticket
     })
 
 
@@ -424,7 +530,7 @@ def get_deals():
             except Exception:
                 mt5_err = None
 
-            print('❌ history_deals_get exception:', e, 'mt5.last_error():', mt5_err)
+            print('history_deals_get exception:', e, 'mt5.last_error():', mt5_err)
             return jsonify({"deals": []}), 500
 
         if deals is None:
@@ -448,7 +554,7 @@ def get_deals():
         return jsonify({"deals": deal_list})
 
     except Exception as e:
-        print('❌ Error fetching deals:', e)
+        print('Error fetching deals:', e)
         return jsonify({"deals": []}), 500
 
 
@@ -472,7 +578,7 @@ def get_tick():
             spread = ask - bid
             return jsonify({"symbol": symbol, "bid": bid, "ask": ask, "spread": spread})
         except Exception as e:
-            print(f"❌ Failed to fetch tick for {symbol}: {e}")
+            print(f"Failed to fetch tick for {symbol}: {e}")
             return jsonify({"error": str(e)}), 500
 
 
@@ -491,10 +597,12 @@ def background_mode_checker():
             
             # Log every 60 checks (5 minutes) to show it's alive, reset counter
             if check_count >= 60:
-                print(f"✅ Mode check: {CURRENT_MODE} account {ACCOUNT} @ {SERVER}")
+                print(f"Mode check: {CURRENT_MODE} account {ACCOUNT} @ {SERVER}")
                 check_count = 0
         except Exception as e:
-            print(f"⚠️  Mode checker error: {e}")
+            print(f"Mode checker error: {e}")
+            # Don't let errors stop the checker, just continue
+            time.sleep(5)
 
 
 if __name__ == "__main__":
@@ -503,5 +611,7 @@ if __name__ == "__main__":
     # Start background mode checker thread
     mode_checker_thread = threading.Thread(target=background_mode_checker, daemon=True)
     mode_checker_thread.start()
-    print("✅ Background mode checker started")
-    app.run(host="0.0.0.0", port=5000)
+    print("Background mode checker started")
+    
+    # Run Flask with threaded=True for better concurrent handling
+    app.run(host="0.0.0.0", port=5000, threaded=True)
