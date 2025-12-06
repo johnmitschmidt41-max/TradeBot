@@ -1,7 +1,7 @@
 // frontend/src/components/SetupVisualization.tsx
 // Live visualization of what V2 bot sees
 
-import { useEffect, useState } from 'react';
+import React, { useEffect, useState, useRef } from 'react';
 
 interface Setup {
   status: string;
@@ -34,6 +34,22 @@ interface Setup {
   setupType?: 'reversal' | 'continuation' | 'trend';
   tradingMode?: 'sweep' | 'trend';
   sweepTimeRemaining?: number;
+  // Pending order info
+  pendingOrderTicket?: number;
+  pendingOrderType?: string;
+  pendingOrderPlacedAt?: string;
+}
+
+interface OpenTrade {
+  ticket: number;
+  symbol: string;
+  side: 'BUY' | 'SELL';
+  entryPrice: number;
+  currentPrice?: number;
+  unrealizedPips?: number;
+  sl: number;
+  tp: number;
+  status: string;
 }
 
 interface LiveSetups {
@@ -48,26 +64,88 @@ const statusColors: Record<string, string> = {
   sweep_detected: 'bg-yellow-500/20 text-yellow-300 border-yellow-500',
   fvg_formed: 'bg-purple-500/20 text-purple-300 border-purple-500',
   waiting_entry: 'bg-orange-500/20 text-orange-300 border-orange-500',
+  ready: 'bg-orange-500/20 text-orange-300 border-orange-500',
   continuation: 'bg-cyan-500/20 text-cyan-300 border-cyan-500',
   trend_entry: 'bg-indigo-500/20 text-indigo-300 border-indigo-500',
+  pattern_entry: 'bg-pink-500/20 text-pink-300 border-pink-500',
+  pending_order: 'bg-lime-500/20 text-lime-300 border-lime-500',
   triggered: 'bg-green-500/20 text-green-300 border-green-500',
   expired: 'bg-gray-500/20 text-gray-300 border-gray-500',
   skipped: 'bg-red-500/20 text-red-300 border-red-500',
+  invalidated: 'bg-red-600/20 text-red-400 border-red-600',
 };
 
 const statusLabels: Record<string, string> = {
   scanning: 'Scanning',
-  sweep_detected: 'Sweep Detected',
-  fvg_formed: 'FVG Formed',
-  waiting_entry: 'Wait..Entry',
-  continuation: 'Continuation',
-  trend_entry: 'Entry',
-  triggered: 'Triggered',
+  sweep_detected: 'Sweep',
+  fvg_formed: 'FVG',
+  waiting_entry: 'Entry',
+  ready: 'Entry',
+  continuation: 'Cont.',
+  trend_entry: 'Trend',
+  pattern_entry: 'Pattern',
+  pending_order: 'Pending',
+  triggered: 'Live',
   expired: 'Expired',
-  skipped: 'Skipped',
+  skipped: 'Skip',
+  invalidated: 'Invalid',
 };
 
-function SetupCard({ symbol, setup }: { symbol: string; setup: Setup | null }) {
+function SetupCard({ symbol, setup, openTrade }: { symbol: string; setup: Setup | null; openTrade?: OpenTrade | null }) {
+  // If there's an open trade (must have ticket to be valid), show that instead
+  if (openTrade && openTrade.ticket) {
+    const pnlColor = (openTrade.unrealizedPips || 0) >= 0 ? 'text-green-400' : 'text-red-400';
+    return (
+      <div className={`bg-gray-800/50 rounded-lg p-2 border min-h-[120px] ${openTrade.side === 'BUY' ? 'border-green-600' : 'border-red-600'}`}>
+        {/* Header */}
+        <div className="flex items-center justify-between mb-2">
+          <div className="flex items-center gap-2">
+            <h3 className="text-lg font-bold text-white">{symbol.replace('z', '')}</h3>
+            <span className={`px-1.5 py-0.5 text-xs font-bold rounded ${openTrade.side === 'BUY' ? 'bg-green-600 text-white' : 'bg-red-600 text-white'}`}>
+              {openTrade.side}
+            </span>
+          </div>
+          <span className="px-2 py-1 text-xs rounded bg-emerald-600/30 text-emerald-300 border border-emerald-500 animate-pulse">
+            🟢 LIVE TRADE
+          </span>
+        </div>
+        
+        {/* Live P/L */}
+        <div className="bg-gray-900 rounded p-3 mb-2">
+          <div className="flex justify-between items-center mb-2">
+            <span className="text-gray-400 text-sm">Unrealized P/L</span>
+            <span className={`text-xl font-bold ${pnlColor}`}>
+              {(openTrade.unrealizedPips || 0) >= 0 ? '+' : ''}{(openTrade.unrealizedPips || 0).toFixed(1)} pips
+            </span>
+          </div>
+          <div className="grid grid-cols-2 gap-2 text-xs">
+            <div>
+              <span className="text-gray-500">Entry:</span>
+              <span className="text-yellow-400 ml-1">{openTrade.entryPrice?.toFixed(5)}</span>
+            </div>
+            <div>
+              <span className="text-gray-500">Current:</span>
+              <span className="text-blue-400 ml-1">{openTrade.currentPrice?.toFixed(5)}</span>
+            </div>
+            <div>
+              <span className="text-gray-500">SL:</span>
+              <span className="text-red-400 ml-1">{openTrade.sl?.toFixed(5)}</span>
+            </div>
+            <div>
+              <span className="text-gray-500">TP:</span>
+              <span className="text-green-400 ml-1">{openTrade.tp?.toFixed(5)}</span>
+            </div>
+          </div>
+        </div>
+        
+        {/* Ticket */}
+        <div className="text-xs text-gray-600">
+          Ticket: #{openTrade.ticket}
+        </div>
+      </div>
+    );
+  }
+  
   if (!setup) {
     return (
       <div className="bg-gray-800/50 rounded-lg p-4 border border-gray-700 min-h-[120px]">
@@ -181,6 +259,27 @@ function SetupCard({ symbol, setup }: { symbol: string; setup: Setup | null }) {
         </div>
       )}
 
+      {/* Pending Order Info */}
+      {setup.pendingOrderTicket && (
+        <div className="mb-3">
+          <div className="text-xs text-gray-400 mb-1">Pending Order</div>
+          <div className="bg-lime-900/30 rounded px-3 py-2 border border-lime-600">
+            <div className="flex justify-between text-sm">
+              <span className="text-lime-300 font-bold">{setup.pendingOrderType}</span>
+              <span className="text-lime-400">#{setup.pendingOrderTicket}</span>
+            </div>
+            {setup.pendingOrderPlacedAt && (
+              <div className="text-xs text-lime-400/70 mt-1">
+                Placed: {new Date(setup.pendingOrderPlacedAt).toLocaleTimeString()}
+              </div>
+            )}
+            <div className="text-xs text-gray-400 mt-1">
+              Waiting for price to reach entry...
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Asian Range (XAU) */}
       {setup.asianHigh && setup.asianLow && (
         <div className="mb-3">
@@ -225,7 +324,7 @@ function SetupCard({ symbol, setup }: { symbol: string; setup: Setup | null }) {
 }
 
 // All symbols the bot tracks
-const ALL_SYMBOLS = ['GBPUSDz', 'EURUSDz', 'XAUUSDz', 'USDJPYz', 'AUDUSDz', 'NZDUSDz', 'USDCADz'];
+const ALL_SYMBOLS = ['GBPUSDz', 'EURUSDz', 'XAUUSDz', 'USDJPYz', 'AUDUSDz', 'NZDUSDz', 'USDCADz', 'EURJPYz'];
 
 export default function SetupVisualization() {
   const [setups, setSetups] = useState<LiveSetups>(() => {
@@ -234,8 +333,135 @@ export default function SetupVisualization() {
     ALL_SYMBOLS.forEach(s => initial[s] = null);
     return initial;
   });
+  const [openTrades, setOpenTrades] = useState<Record<string, OpenTrade | null>>({});
   const [connected, setConnected] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  
+  // Track recently closed trades to prevent poll from re-adding stale data
+  const recentlyClosedRef = useRef<Set<string>>(new Set());
+  
+  // Debounce ref to prevent rapid state updates causing flicker
+  const pendingSetupsRef = useRef<LiveSetups | null>(null);
+  const debounceTimerRef = useRef<NodeJS.Timeout | null>(null);
+  
+  // Debounced setups update to prevent flicker
+  const updateSetupsDebounced = (newSetups: LiveSetups) => {
+    pendingSetupsRef.current = newSetups;
+    
+    // Clear existing timer
+    if (debounceTimerRef.current) {
+      clearTimeout(debounceTimerRef.current);
+    }
+    
+    // Set new timer - update after 100ms of no new updates
+    debounceTimerRef.current = setTimeout(() => {
+      if (pendingSetupsRef.current) {
+        setSetups(pendingSetupsRef.current);
+        pendingSetupsRef.current = null;
+      }
+    }, 100);
+  };
+
+  // Fetch setups (backup polling ONLY when SSE is disconnected)
+  const fetchSetups = async () => {
+    try {
+      const response = await fetch('/api/setups');
+      const data = await response.json();
+      if (data.setups) {
+        // Use immediate update for polling (only runs when disconnected)
+        setSetups(prev => {
+          const merged: LiveSetups = {};
+          ALL_SYMBOLS.forEach(symbol => {
+            merged[symbol] = data.setups[symbol] ?? prev[symbol] ?? null;
+          });
+          return merged;
+        });
+      }
+    } catch (e) {
+      console.error('Failed to fetch setups:', e);
+    }
+  };
+
+  // Fetch open positions from MT5 bridge
+  const fetchOpenPositions = async () => {
+    try {
+      const response = await fetch('/api/positions');
+      const data = await response.json();
+      
+      // Check if we actually have positions (array with items)
+      const positions = data.positions || [];
+      
+      setOpenTrades(prev => {
+        const newOpenTrades: Record<string, OpenTrade | null> = {};
+        
+        // Track which symbols have positions
+        const symbolsWithPositions = new Set<string>();
+        
+        // Add/update positions we found
+        for (const pos of positions) {
+          if (ALL_SYMBOLS.includes(pos.symbol)) {
+            // Skip if this symbol was recently closed (prevents stale data race)
+            if (recentlyClosedRef.current.has(pos.symbol)) {
+              continue;
+            }
+            
+            symbolsWithPositions.add(pos.symbol);
+            const existingTrade = prev[pos.symbol];
+            
+            newOpenTrades[pos.symbol] = {
+              ticket: pos.ticket,
+              symbol: pos.symbol,
+              side: pos.side,
+              entryPrice: pos.entryPrice,
+              currentPrice: pos.currentPrice ?? existingTrade?.currentPrice,
+              // Keep existing unrealizedPips if new value not provided
+              unrealizedPips: pos.unrealizedPips ?? existingTrade?.unrealizedPips ?? 0,
+              sl: pos.sl,
+              tp: pos.tp,
+              status: 'open'
+            };
+          }
+        }
+        
+        // For all tracked symbols, set to null if no position found
+        ALL_SYMBOLS.forEach(s => {
+          if (!symbolsWithPositions.has(s)) {
+            newOpenTrades[s] = null;
+          }
+        });
+        
+        // Clear recently closed ref if those symbols have no position anymore
+        recentlyClosedRef.current.forEach(symbol => {
+          if (!symbolsWithPositions.has(symbol)) {
+            recentlyClosedRef.current.delete(symbol);
+          }
+        });
+        
+        return newOpenTrades;
+      });
+    } catch (e) {
+      console.error('Failed to fetch positions:', e);
+    }
+  };
+
+  // Poll for open positions every 5 seconds
+  useEffect(() => {
+    fetchOpenPositions(); // Initial fetch
+    const positionInterval = setInterval(fetchOpenPositions, 5000);
+    return () => clearInterval(positionInterval);
+  }, []);
+
+  // Backup polling for setups ONLY when SSE is disconnected
+  useEffect(() => {
+    // Only poll when not connected to SSE
+    if (connected) {
+      return; // SSE is working, no need to poll
+    }
+    
+    fetchSetups(); // Initial fetch when disconnected
+    const setupInterval = setInterval(fetchSetups, 3000);
+    return () => clearInterval(setupInterval);
+  }, [connected]); // Re-run when connection status changes
 
   useEffect(() => {
     let eventSource: EventSource | null = null;
@@ -262,15 +488,40 @@ export default function SetupVisualization() {
           setConnected(true);
           try {
             const data = JSON.parse(event.data);
+            
+            // Handle setup updates - use debounced update to prevent flicker
             if (data.setups) {
-              // Merge incoming setups with existing state, keeping all symbols
-              setSetups(prev => {
-                const merged: LiveSetups = {};
-                ALL_SYMBOLS.forEach(symbol => {
-                  merged[symbol] = data.setups[symbol] ?? prev[symbol] ?? null;
-                });
-                return merged;
+              // Merge incoming setups, keeping all symbols
+              const merged: LiveSetups = {};
+              ALL_SYMBOLS.forEach(symbol => {
+                merged[symbol] = data.setups[symbol] ?? null;
               });
+              updateSetupsDebounced(merged);
+            }
+            
+            // Handle trade updates (live P/L)
+            if (data.type === 'trade_update' && data.trade) {
+              // Remove from recently closed since we have an active update
+              recentlyClosedRef.current.delete(data.trade.symbol);
+              setOpenTrades(prev => ({
+                ...prev,
+                [data.trade.symbol]: data.trade
+              }));
+            }
+            
+            // Handle trade closed
+            if (data.type === 'trade_closed' && data.trade) {
+              // Mark as recently closed to prevent poll from re-adding stale data
+              recentlyClosedRef.current.add(data.trade.symbol);
+              // Clear after 10 seconds (enough time for poll to sync)
+              setTimeout(() => {
+                recentlyClosedRef.current.delete(data.trade.symbol);
+              }, 10000);
+              
+              setOpenTrades(prev => ({
+                ...prev,
+                [data.trade.symbol]: null
+              }));
             }
           } catch (e) {
             console.error('Failed to parse setup data:', e);
@@ -328,7 +579,7 @@ export default function SetupVisualization() {
       {/* Setup Cards */}
       <div className="p-4 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 auto-rows-fr">
         {Object.entries(setups).map(([symbol, setup]) => (
-          <SetupCard key={symbol} symbol={symbol} setup={setup} />
+          <SetupCard key={symbol} symbol={symbol} setup={setup} openTrade={openTrades[symbol]} />
         ))}
       </div>
     </div>

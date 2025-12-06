@@ -5,21 +5,25 @@ import { useEffect, useState } from 'react';
 
 interface Trade {
   _id: string;
+  ticket?: string | number;
   symbol: string;
   side: 'BUY' | 'SELL';
-  entryPrice: number;
-  sl: number;
-  tp: number;
-  volume: number;
-  slPips: number;
+  entryPrice?: number;
+  sl?: number;
+  tp?: number;
+  volume?: number;
+  slPips?: number;
   tpPips?: number;
-  riskPercent: number;
-  strategy: string;
-  openTime: string;
+  pnlPips?: number;
+  riskPercent?: number;
+  strategy?: string;
+  openTime?: string;
   closeTime?: string;
   closePrice?: number;
   status: 'open' | 'closed';
   pnl?: number;
+  profit?: number;
+  result?: 'win' | 'loss' | 'breakeven';
   notes?: string;
 }
 
@@ -40,19 +44,76 @@ export default function TradeJournal() {
   const [stats, setStats] = useState<Stats | null>(null);
   const [loading, setLoading] = useState(true);
   const [filter, setFilter] = useState<'all' | 'open' | 'closed'>('all');
+  const [lastSync, setLastSync] = useState<string | null>(null);
+  const [tradingMode, setTradingMode] = useState<'DEMO' | 'REAL' | null>(null);
+
+  // Fetch trading mode
+  const fetchTradingMode = async () => {
+    try {
+      const response = await fetch(`${SERVER_URL}/api/mode`);
+      const data = await response.json();
+      setTradingMode(data.mode || 'DEMO');
+    } catch (e) {
+      console.error('Failed to fetch trading mode:', e);
+      setTradingMode('DEMO');
+    }
+  };
+
+  // Sync history from MT5 bridge (less frequent - every 60 seconds)
+  const syncHistory = async () => {
+    try {
+      const response = await fetch(`${SERVER_URL}/api/history?hours=24`);
+      const data = await response.json();
+      if (data.synced > 0) {
+        console.log(`Synced ${data.synced} trades from MT5 history`);
+        setLastSync(new Date().toLocaleTimeString());
+        // Refresh trades after sync
+        fetchTrades();
+        fetchStats();
+      }
+    } catch (e) {
+      console.error('Failed to sync history:', e);
+    }
+  };
 
   useEffect(() => {
+    // Fetch trading mode first
+    fetchTradingMode();
+    
+    // Check mode periodically (every 30 seconds)
+    const modeInterval = setInterval(fetchTradingMode, 30000);
+
+    return () => {
+      clearInterval(modeInterval);
+    };
+  }, []);
+
+  useEffect(() => {
+    // Only fetch trades if in REAL mode
+    if (tradingMode !== 'REAL') {
+      setLoading(false);
+      return;
+    }
+
+    // Initial sync from MT5 history
+    syncHistory();
     fetchTrades();
     fetchStats();
     
-    // Refresh every 30 seconds
-    const interval = setInterval(() => {
+    // Sync history every 60 seconds (less frequent)
+    const historyInterval = setInterval(syncHistory, 60000);
+    
+    // Refresh display every 30 seconds
+    const displayInterval = setInterval(() => {
       fetchTrades();
       fetchStats();
     }, 30000);
 
-    return () => clearInterval(interval);
-  }, [filter]);
+    return () => {
+      clearInterval(historyInterval);
+      clearInterval(displayInterval);
+    };
+  }, [filter, tradingMode]);
 
   const fetchTrades = async () => {
     try {
@@ -90,29 +151,55 @@ export default function TradeJournal() {
           <div className="flex items-center gap-2">
             <span className="text-xs font-bold bg-green-700 px-2 py-1 rounded text-white">JOURNAL</span>
             <h2 className="text-lg font-semibold text-white">Trade Journal</h2>
+            {tradingMode && (
+              <span className={`text-xs font-bold px-2 py-0.5 rounded ${
+                tradingMode === 'REAL' ? 'bg-green-600 text-white' : 'bg-yellow-600 text-white'
+              }`}>
+                {tradingMode}
+              </span>
+            )}
+            {lastSync && tradingMode === 'REAL' && (
+              <span className="text-xs text-gray-500">
+                (MT5 synced: {lastSync})
+              </span>
+            )}
           </div>
           
-          {/* Filter Tabs */}
-          <div className="flex gap-1 bg-gray-700 rounded-lg p-1">
-            {(['all', 'open', 'closed'] as const).map((f) => (
-              <button
-                key={f}
-                onClick={() => setFilter(f)}
-                className={`px-3 py-1 text-xs rounded ${
-                  filter === f 
-                    ? 'bg-blue-600 text-white' 
-                    : 'text-gray-400 hover:text-white'
-                }`}
-              >
-                {f.charAt(0).toUpperCase() + f.slice(1)}
-              </button>
-            ))}
-          </div>
+          {/* Filter Tabs - only show in REAL mode */}
+          {tradingMode === 'REAL' && (
+            <div className="flex gap-1 bg-gray-700 rounded-lg p-1">
+              {(['all', 'open', 'closed'] as const).map((f) => (
+                <button
+                  key={f}
+                  onClick={() => setFilter(f)}
+                  className={`px-3 py-1 text-xs rounded ${
+                    filter === f 
+                      ? 'bg-blue-600 text-white' 
+                      : 'text-gray-400 hover:text-white'
+                  }`}
+                >
+                  {f.charAt(0).toUpperCase() + f.slice(1)}
+                </button>
+              ))}
+            </div>
+          )}
         </div>
       </div>
 
-      {/* Stats Row */}
-      {stats && (
+      {/* DEMO Mode Message */}
+      {tradingMode !== 'REAL' && (
+        <div className="p-12 text-center">
+          <div className="text-6xl mb-4">🧪</div>
+          <h3 className="text-xl font-semibold text-white mb-2">Demo Mode Active</h3>
+          <p className="text-gray-400 max-w-md mx-auto">
+            Trade history is only displayed when the bot is running in <span className="text-green-400 font-bold">REAL</span> mode.
+            Switch to real mode to view and track your actual trades.
+          </p>
+        </div>
+      )}
+
+      {/* Stats Row - only show in REAL mode */}
+      {tradingMode === 'REAL' && stats && (
         <div className="bg-gray-800/50 px-4 py-3 border-b border-gray-700 grid grid-cols-6 gap-4 text-center">
           <div>
             <div className="text-2xl font-bold text-white">{stats.totalTrades}</div>
@@ -147,37 +234,42 @@ export default function TradeJournal() {
         </div>
       )}
 
-      {/* Trade List */}
-      <div className="max-h-96 overflow-y-auto">
-        {loading ? (
-          <div className="p-8 text-center text-gray-500">Loading trades...</div>
-        ) : trades.length === 0 ? (
-          <div className="p-8 text-center text-gray-500">
-            No trades recorded yet. Start the V2 bot to begin trading.
-          </div>
-        ) : (
-          <table className="w-full text-sm">
-            <thead className="bg-gray-800 text-gray-400 text-xs uppercase sticky top-0">
-              <tr>
-                <th className="px-4 py-2 text-left">Time</th>
-                <th className="px-4 py-2 text-left">Symbol</th>
-                <th className="px-4 py-2 text-left">Side</th>
-                <th className="px-4 py-2 text-right">Entry</th>
-                <th className="px-4 py-2 text-right">SL</th>
-                <th className="px-4 py-2 text-right">TP</th>
-                <th className="px-4 py-2 text-right">Volume</th>
-                <th className="px-4 py-2 text-center">Status</th>
-                <th className="px-4 py-2 text-right">PnL</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-gray-800">
-              {trades.map((trade) => (
-                <tr key={trade._id} className="hover:bg-gray-800/50">
+      {/* Trade List - only show in REAL mode */}
+      {tradingMode === 'REAL' && (
+        <div className="max-h-96 overflow-y-auto">
+          {loading ? (
+            <div className="p-8 text-center text-gray-500">Loading trades...</div>
+          ) : trades.length === 0 ? (
+            <div className="p-8 text-center text-gray-500">
+              No trades recorded yet. Start the V2 bot to begin trading.
+            </div>
+          ) : (
+            <table className="w-full text-sm">
+              <thead className="bg-gray-800 text-gray-400 text-xs uppercase sticky top-0">
+                <tr>
+                  <th className="px-4 py-2 text-left">Time</th>
+                  <th className="px-4 py-2 text-left">Symbol</th>
+                  <th className="px-4 py-2 text-left">Side</th>
+                  <th className="px-4 py-2 text-right">Entry</th>
+                  <th className="px-4 py-2 text-right">Close</th>
+                  <th className="px-4 py-2 text-right">Volume</th>
+                  <th className="px-4 py-2 text-center">Result</th>
+                  <th className="px-4 py-2 text-right">PnL</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-gray-800">
+                {trades.map((trade, index) => {
+                const pnlValue = trade.pnl ?? trade.profit;
+                const timeStr = trade.closeTime || trade.openTime;
+                const displayTime = timeStr ? new Date(timeStr).toLocaleString() : 'Unknown';
+                
+                return (
+                <tr key={trade._id || `trade-${index}`} className="hover:bg-gray-800/50">
                   <td className="px-4 py-3 text-gray-400">
-                    {new Date(trade.openTime).toLocaleString()}
+                    {displayTime}
                   </td>
                   <td className="px-4 py-3 text-white font-medium">
-                    {trade.symbol.replace('z', '')}
+                    {trade.symbol?.replace('z', '') || 'Unknown'}
                   </td>
                   <td className="px-4 py-3">
                     <span className={`px-2 py-0.5 text-xs font-bold rounded ${
@@ -187,43 +279,53 @@ export default function TradeJournal() {
                     </span>
                   </td>
                   <td className="px-4 py-3 text-right font-mono text-gray-300">
-                    {trade.entryPrice.toFixed(5)}
+                    {trade.entryPrice ? trade.entryPrice.toFixed(trade.symbol?.includes('JPY') ? 3 : trade.symbol?.includes('XAU') ? 2 : 5) : '-'}
                   </td>
-                  <td className="px-4 py-3 text-right font-mono text-red-400">
-                    {trade.sl.toFixed(5)}
-                  </td>
-                  <td className="px-4 py-3 text-right font-mono text-green-400">
-                    {trade.tp.toFixed(5)}
+                  <td className="px-4 py-3 text-right font-mono text-gray-300">
+                    {trade.closePrice ? trade.closePrice.toFixed(trade.symbol?.includes('JPY') ? 3 : trade.symbol?.includes('XAU') ? 2 : 5) : '-'}
                   </td>
                   <td className="px-4 py-3 text-right text-gray-300">
-                    {trade.volume.toFixed(2)}
+                    {trade.volume?.toFixed(2) || '-'}
                   </td>
                   <td className="px-4 py-3 text-center">
-                    <span className={`px-2 py-0.5 text-xs rounded ${
-                      trade.status === 'open' 
-                        ? 'bg-blue-600/30 text-blue-300 border border-blue-600' 
-                        : 'bg-gray-600/30 text-gray-300 border border-gray-600'
-                    }`}>
-                      {trade.status}
-                    </span>
+                    {trade.result ? (
+                      <span className={`px-2 py-0.5 text-xs font-bold rounded ${
+                        trade.result === 'win' ? 'bg-green-600 text-white' : 
+                        trade.result === 'loss' ? 'bg-red-600 text-white' : 
+                        'bg-gray-600 text-white'
+                      }`}>
+                        {trade.result.toUpperCase()}
+                      </span>
+                    ) : (
+                      <span className={`px-2 py-0.5 text-xs rounded ${
+                        trade.status === 'open' 
+                          ? 'bg-blue-600/30 text-blue-300 border border-blue-600' 
+                          : 'bg-gray-600/30 text-gray-300 border border-gray-600'
+                      }`}>
+                        {trade.status}
+                      </span>
+                    )}
                   </td>
-                  <td className={`px-4 py-3 text-right font-mono ${
-                    trade.pnl === undefined ? 'text-gray-500' :
-                    trade.pnl >= 0 ? 'text-green-400' : 'text-red-400'
+                  <td className={`px-4 py-3 text-right font-mono font-bold ${
+                    pnlValue === undefined ? 'text-gray-500' :
+                    pnlValue >= 0 ? 'text-green-400' : 'text-red-400'
                   }`}>
-                    {trade.pnl !== undefined ? `$${trade.pnl.toFixed(2)}` : '-'}
+                    {pnlValue !== undefined ? `${pnlValue >= 0 ? '+' : ''}$${pnlValue.toFixed(2)}` : '-'}
                   </td>
                 </tr>
-              ))}
-            </tbody>
-          </table>
-        )}
-      </div>
+              )})}
+              </tbody>
+            </table>
+          )}
+        </div>
+      )}
 
       {/* Footer */}
-      <div className="bg-gray-800 px-4 py-2 border-t border-gray-700 text-xs text-gray-500">
-        Last 30 days • {trades.length} trades shown
-      </div>
+      {tradingMode === 'REAL' && (
+        <div className="bg-gray-800 px-4 py-2 border-t border-gray-700 text-xs text-gray-500">
+          Last 30 days • {trades.length} trades shown
+        </div>
+      )}
     </div>
   );
 }

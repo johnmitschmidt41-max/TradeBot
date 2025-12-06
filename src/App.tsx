@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, ReactNode } from 'react';
 import SetupVisualization from './components/SetupVisualization';
 import TradeJournal from './components/TradeJournal';
+import ControlPanel from './components/ControlPanel';
 
 interface LogBoxProps {
   title: string;
@@ -388,6 +389,7 @@ const LogBox = ({ title, color, fullWidth = false }: LogBoxProps) => {
 
 export default function App() {
   const [showJournal, setShowJournal] = useState(false);
+  const [showControl, setShowControl] = useState(true);
 
   return (
     <div className="min-h-screen bg-gray-950 p-6">
@@ -400,18 +402,37 @@ export default function App() {
             </h1>
             <p className="text-gray-400 text-sm mt-1">Real-time monitoring | Live setups | Trade journal</p>
           </div>
-          <button
-            onClick={() => setShowJournal(!showJournal)}
-            className={`px-4 py-2 rounded-lg font-medium transition-all ${
-              showJournal
-                ? 'bg-green-600 text-white'
-                : 'bg-gray-800 text-gray-400 hover:bg-gray-700 hover:text-white'
-            }`}
-          >
-            {showJournal ? 'Hide Journal' : 'Trade Journal'}
-          </button>
+          <div className="flex gap-2">
+            <button
+              onClick={() => setShowControl(!showControl)}
+              className={`px-4 py-2 rounded-lg font-medium transition-all ${
+                showControl
+                  ? 'bg-purple-600 text-white'
+                  : 'bg-gray-800 text-gray-400 hover:bg-gray-700 hover:text-white'
+              }`}
+            >
+              {showControl ? 'Hide Control' : 'Control Panel'}
+            </button>
+            <button
+              onClick={() => setShowJournal(!showJournal)}
+              className={`px-4 py-2 rounded-lg font-medium transition-all ${
+                showJournal
+                  ? 'bg-green-600 text-white'
+                  : 'bg-gray-800 text-gray-400 hover:bg-gray-700 hover:text-white'
+              }`}
+            >
+              {showJournal ? 'Hide Journal' : 'Trade Journal'}
+            </button>
+          </div>
         </div>
       </div>
+
+      {/* Control Panel (toggleable) */}
+      {showControl && (
+        <div className="max-w-7xl mx-auto mb-6">
+          <ControlPanel />
+        </div>
+      )}
 
       {/* Trade Journal (toggleable) */}
       {showJournal && (

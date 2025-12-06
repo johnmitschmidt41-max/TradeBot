@@ -17,29 +17,41 @@ export async function connectDB() {
     return null;
   }
 
-  try {
-    // Add TLS options to fix SSL issues with some Node versions
-    client = new MongoClient(uri, {
-      tls: true,
-      tlsAllowInvalidCertificates: false,
-      serverSelectionTimeoutMS: 5000,
-      connectTimeoutMS: 10000,
-    });
-    await client.connect();
-    db = client.db(process.env.MONGODB_DB || 'tradebot');
-    
-    // Create indexes for efficient queries
-    await db.collection('trades').createIndex({ symbol: 1, openTime: -1 });
-    await db.collection('trades').createIndex({ status: 1 });
-    await db.collection('setups').createIndex({ symbol: 1, time: -1 });
-    await db.collection('setups').createIndex({ status: 1 });
-    
-    console.log('✅ Connected to MongoDB');
-    return db;
-  } catch (err) {
-    console.error('❌ MongoDB connection failed:', err.message);
-    return null;
+  // List of connection configurations to try
+  const configs = [
+    { name: 'default', options: { serverSelectionTimeoutMS: 10000 } },
+    { name: 'TLS1.2 min', options: { serverSelectionTimeoutMS: 10000, tls: true, minTlsVersion: 'TLSv1.2' } },
+    { name: 'allow invalid', options: { serverSelectionTimeoutMS: 10000, tls: true, tlsAllowInvalidCertificates: true } },
+  ];
+
+  for (const config of configs) {
+    try {
+      console.log(`🔄 Trying MongoDB connection: ${config.name}...`);
+      client = new MongoClient(uri, config.options);
+      await client.connect();
+      db = client.db(process.env.MONGODB_DB || 'tradebot');
+      
+      // Create indexes for efficient queries
+      await db.collection('trades').createIndex({ symbol: 1, openTime: -1 });
+      await db.collection('trades').createIndex({ status: 1 });
+      await db.collection('trades').createIndex({ ticket: 1 }, { unique: false });
+      await db.collection('setups').createIndex({ symbol: 1, time: -1 });
+      await db.collection('setups').createIndex({ status: 1 });
+      
+      console.log(`✅ Connected to MongoDB (${config.name})`);
+      return db;
+    } catch (err) {
+      console.error(`❌ MongoDB ${config.name} failed:`, err.message.split('\n')[0]);
+      if (client) {
+        try { await client.close(); } catch {}
+        client = null;
+      }
+    }
   }
+  
+  console.error('❌ All MongoDB connection attempts failed');
+  console.log('💡 The journal will work without MongoDB - trades will be fetched directly from MT5');
+  return null;
 }
 
 /**
