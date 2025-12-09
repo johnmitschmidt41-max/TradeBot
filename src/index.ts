@@ -19,7 +19,7 @@ async function run() {
 
   // New SweepFVG Strategy
   const strategy = new SweepFVGStrategy(connector, {
-    riskPercent: 10.0,
+    riskPercent: 5.0,
     maxTradesPerDay: 12,
     maxTradesPerSymbol: 4
   });

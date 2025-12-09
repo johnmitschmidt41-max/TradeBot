@@ -85,7 +85,7 @@ interface StrategyConfig {
 const DEFAULT_CONFIG: StrategyConfig = {
   symbols: ['GBPUSDz', 'EURUSDz', 'XAUUSDz', 'USDJPYz', 'AUDUSDz', 'NZDUSDz', 'USDCADz', 'EURJPYz'],
   entryTimeframe: 'M5',
-  riskPercent: 10.0,
+  riskPercent: 5.0,
   maxTradesPerDay: 20,  // Increased for more symbols
   maxTradesPerSymbol: 3,
   
@@ -1854,7 +1854,7 @@ export class SweepFVGStrategy {
     if (!emaFast || !emaSlow) return;
     
     const emaSeparation = Math.abs(emaFast - emaSlow) / pipSize;
-    const minSeparation = isXAU ? 6 : 2; // Minimum EMA separation in pips (reduced from 10/5 - was too strict)
+    const minSeparation = isXAU ? 8 : 4; // Minimum EMA separation in pips (increased for December - clearer trends only)
     
     // Determine trend direction
     let trendDirection: 'BUY' | 'SELL' | null = null;
