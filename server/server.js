@@ -357,6 +357,98 @@ app.post('/api/mode', (req, res) => {
   }
 });
 
+// ═══════════════════════════════════════════════════════════════════
+// RISK CONTROL ENDPOINTS (Per-Category)
+// ═══════════════════════════════════════════════════════════════════
+
+// GET current risk settings (all categories)
+app.get('/api/risk', (req, res) => {
+  try {
+    if (fs.existsSync(TRADING_MODE_FILE)) {
+      const config = JSON.parse(fs.readFileSync(TRADING_MODE_FILE, 'utf8'));
+      res.json({
+        riskFX: config.riskFX || 5.0,
+        riskXAU: config.riskXAU || 3.0,
+        riskIndices: config.riskIndices || 3.0
+      });
+    } else {
+      res.json({ riskFX: 5.0, riskXAU: 3.0, riskIndices: 3.0 });
+    }
+  } catch (err) {
+    console.error('Error reading risk config:', err);
+    res.json({ riskFX: 5.0, riskXAU: 3.0, riskIndices: 3.0 });
+  }
+});
+
+// POST update risk (supports per-category or single value)
+app.post('/api/risk', (req, res) => {
+  try {
+    const { riskFX, riskXAU, riskIndices, riskPercent } = req.body;
+    
+    // Read existing config
+    let config = { mode: 'REAL', riskFX: 5.0, riskXAU: 3.0, riskIndices: 3.0 };
+    if (fs.existsSync(TRADING_MODE_FILE)) {
+      config = JSON.parse(fs.readFileSync(TRADING_MODE_FILE, 'utf8'));
+    }
+    
+    // Validate and update each category if provided
+    const validateRisk = (val) => {
+      const risk = parseFloat(val);
+      return !isNaN(risk) && risk >= 0.5 && risk <= 20 ? risk : null;
+    };
+    
+    // Handle legacy single riskPercent (update all categories)
+    if (riskPercent !== undefined) {
+      const risk = validateRisk(riskPercent);
+      if (risk === null) {
+        return res.status(400).json({ error: 'Risk must be between 0.5% and 20%' });
+      }
+      config.riskFX = risk;
+      config.riskXAU = risk;
+      config.riskIndices = risk;
+    } else {
+      // Update individual categories
+      if (riskFX !== undefined) {
+        const risk = validateRisk(riskFX);
+        if (risk === null) {
+          return res.status(400).json({ error: 'FX Risk must be between 0.5% and 20%' });
+        }
+        config.riskFX = risk;
+      }
+      
+      if (riskXAU !== undefined) {
+        const risk = validateRisk(riskXAU);
+        if (risk === null) {
+          return res.status(400).json({ error: 'XAU Risk must be between 0.5% and 20%' });
+        }
+        config.riskXAU = risk;
+      }
+      
+      if (riskIndices !== undefined) {
+        const risk = validateRisk(riskIndices);
+        if (risk === null) {
+          return res.status(400).json({ error: 'Indices Risk must be between 0.5% and 20%' });
+        }
+        config.riskIndices = risk;
+      }
+    }
+    
+    // Save
+    fs.writeFileSync(TRADING_MODE_FILE, JSON.stringify(config, null, 2));
+    
+    console.log(`📊 Risk updated: FX=${config.riskFX}%, XAU=${config.riskXAU}%, Indices=${config.riskIndices}%`);
+    res.json({
+      success: true,
+      riskFX: config.riskFX,
+      riskXAU: config.riskXAU,
+      riskIndices: config.riskIndices
+    });
+  } catch (err) {
+    console.error('Error updating risk:', err);
+    res.status(500).json({ error: 'Failed to update risk' });
+  }
+});
+
 // Account info endpoint - proxies to Python bridge
 app.get('/api/account', async (req, res) => {
   try {
@@ -490,6 +582,115 @@ app.post('/api/test-setup', (req, res) => {
 
 const MT5_BRIDGE_URL = process.env.MT5_BRIDGE || 'http://127.0.0.1:5000';
 
+// Helper function to parse MT5 deals into trades
+function parseDealsIntoTrades(deals) {
+  const closedTrades = [];
+  const entryDeals = new Map(); // order -> entry deal
+  
+  // First pass: collect ALL entry deals (profit = 0, order > 0, has symbol)
+  for (const deal of deals) {
+    if (!deal.symbol || deal.symbol === '') continue;
+    if (deal.profit === 0 && deal.order > 0 && deal.volume > 0) {
+      entryDeals.set(deal.order, deal);
+    }
+  }
+  
+  console.log(`📊 Found ${entryDeals.size} entry deals`);
+  
+  // Second pass: find exit deals and match with entries
+  const usedEntries = new Set(); // Track which entries have been matched
+  
+  for (const deal of deals) {
+    if (!deal.symbol || deal.symbol === '') continue;
+    if (deal.profit === 0) continue; // Skip entry deals
+    
+    let entryDeal = null;
+    let matchedOrder = null;
+    
+    // Try 1: Direct order match (manual close)
+    if (deal.order > 0 && entryDeals.has(deal.order)) {
+      entryDeal = entryDeals.get(deal.order);
+      matchedOrder = deal.order;
+    }
+    
+    // Try 2: Match by symbol/volume/time (for SL/TP exits where order=0)
+    if (!entryDeal) {
+      let bestMatch = null;
+      let bestTimeDiff = Infinity;
+      
+      for (const [order, entry] of entryDeals.entries()) {
+        if (usedEntries.has(order)) continue;
+        if (entry.symbol !== deal.symbol) continue;
+        if (Math.abs(entry.volume - deal.volume) > 0.001) continue;
+        if (entry.time >= deal.time) continue;
+        
+        const timeDiff = deal.time - entry.time;
+        if (timeDiff < bestTimeDiff) {
+          bestTimeDiff = timeDiff;
+          bestMatch = entry;
+          matchedOrder = order;
+        }
+      }
+      
+      if (bestMatch) {
+        entryDeal = bestMatch;
+      }
+    }
+    
+    // Mark entry as used
+    if (matchedOrder) {
+      usedEntries.add(matchedOrder);
+    }
+    
+    // Determine side
+    let side;
+    if (entryDeal) {
+      side = entryDeal.type === 0 ? 'BUY' : 'SELL';
+    } else {
+      side = deal.type === 1 ? 'BUY' : 'SELL';
+    }
+    
+    // Use a consistent ticket: always prefer entry order, fallback to exit timestamp
+    // This prevents duplicates
+    const ticket = matchedOrder || `exit_${deal.time}_${deal.symbol}`;
+    
+    const trade = {
+      ticket,
+      symbol: deal.symbol,
+      side,
+      entryPrice: entryDeal ? entryDeal.price : 0,
+      closePrice: deal.price,
+      volume: deal.volume,
+      profit: deal.profit,
+      pnl: deal.profit,
+      pnlPips: 0,
+      openTime: entryDeal ? new Date(entryDeal.time * 1000).toISOString() : new Date((deal.time - 300) * 1000).toISOString(),
+      closeTime: new Date(deal.time * 1000).toISOString(),
+      status: 'closed',
+      result: deal.profit > 0 ? 'win' : deal.profit < 0 ? 'loss' : 'breakeven',
+      strategy: entryDeal?.comment || deal.comment || 'Unknown',
+      magic: entryDeal?.magic || deal.magic || 0,
+      exitComment: deal.comment || '' // Store the exit comment (e.g., "[sl xxx]")
+    };
+    
+    // Calculate pips
+    if (trade.entryPrice > 0 && trade.closePrice > 0) {
+      const isXAU = deal.symbol.includes('XAU');
+      const isJPY = deal.symbol.includes('JPY');
+      const pipSize = isXAU ? 0.1 : isJPY ? 0.01 : 0.0001;
+      if (trade.side === 'BUY') {
+        trade.pnlPips = Math.round((trade.closePrice - trade.entryPrice) / pipSize);
+      } else {
+        trade.pnlPips = Math.round((trade.entryPrice - trade.closePrice) / pipSize);
+      }
+    }
+    
+    closedTrades.push(trade);
+  }
+  
+  return closedTrades;
+}
+
 // Get all open positions from MT5
 app.get('/api/positions', async (req, res) => {
   try {
@@ -522,12 +723,69 @@ app.get('/api/positions', async (req, res) => {
   }
 });
 
+// Full sync: fetch ALL history from MT5 and sync to MongoDB
+app.post('/api/sync-history', async (req, res) => {
+  try {
+    const days = parseInt(req.query.days) || 30;
+    const since = Math.floor(Date.now() / 1000) - (days * 86400);
+    
+    console.log(`🔄 FULL SYNC: Fetching ${days} days of MT5 history...`);
+    
+    const response = await fetch(`${MT5_BRIDGE_URL}/deals?since=${since}`);
+    const data = await response.json();
+    
+    if (!data.deals || data.deals.length === 0) {
+      return res.json({ success: true, message: 'No deals to sync', synced: 0 });
+    }
+    
+    console.log(`📡 Got ${data.deals.length} deals from MT5`);
+    
+    const closedTrades = parseDealsIntoTrades(data.deals);
+    console.log(`📊 Parsed ${closedTrades.length} closed trades`);
+    
+    // Sync to MongoDB
+    const db = getDB();
+    if (!db) {
+      return res.json({ success: false, error: 'MongoDB not connected', synced: 0 });
+    }
+    
+    // First, clear old bad data (trades with entryPrice = 0 that might have duplicates)
+    const deleteResult = await db.collection('trades').deleteMany({
+      $or: [
+        { ticket: { $regex: /^exit_/ } },  // Old fallback tickets
+        { ticket: { $regex: /_\d+$/ } }    // Old symbol_time format
+      ]
+    });
+    console.log(`🗑️ Cleaned up ${deleteResult.deletedCount} old/duplicate records`);
+    
+    let synced = 0;
+    for (const trade of closedTrades) {
+      try {
+        await db.collection('trades').updateOne(
+          { ticket: trade.ticket },
+          { $set: { ...trade, updatedAt: new Date() } },
+          { upsert: true }
+        );
+        synced++;
+      } catch (e) {
+        console.error('Error upserting trade:', e.message);
+      }
+    }
+    
+    console.log(`✅ FULL SYNC complete: ${synced} trades synced to MongoDB`);
+    res.json({ success: true, synced, totalDeals: data.deals.length, trades: closedTrades.length });
+  } catch (e) {
+    console.error('Full sync error:', e.message);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
 // Get trade history from MT5 (limited to recent trades)
 app.get('/api/history', async (req, res) => {
   try {
-    // Default to last 24 hours, max 7 days
-    const hours = Math.min(parseInt(req.query.hours) || 24, 168);
-    const since = Math.floor(Date.now() / 1000) - (hours * 3600);
+    // Default to last 7 days for history endpoint
+    const days = parseInt(req.query.days) || 7;
+    const since = Math.floor(Date.now() / 1000) - (days * 86400);
     
     console.log(`📡 Fetching MT5 history since ${new Date(since * 1000).toISOString()}`);
     
@@ -541,76 +799,7 @@ app.get('/api/history', async (req, res) => {
     
     console.log(`📡 Got ${data.deals.length} deals from MT5`);
     
-    // MT5 deals structure:
-    // - Entry deals: have order > 0, profit = 0, type 0/1 (BUY/SELL entry)
-    // - Exit deals: have order = 0 (for SL/TP) or order > 0 (manual close), profit != 0, type 0/1 (close direction)
-    // Exit deals for SL/TP have comment like "[sl xxx]" or "[tp xxx]"
-    
-    const closedTrades = [];
-    const entryDeals = new Map(); // order -> entry deal
-    
-    // First pass: collect entry deals (profit = 0, order > 0, has symbol)
-    for (const deal of data.deals) {
-      if (!deal.symbol || deal.symbol === '') continue;
-      if (deal.profit === 0 && deal.order > 0 && deal.volume > 0) {
-        entryDeals.set(deal.order, deal);
-      }
-    }
-    
-    // Second pass: find exit deals and match with entries
-    for (const deal of data.deals) {
-      if (!deal.symbol || deal.symbol === '') continue;
-      if (deal.profit === 0) continue; // Skip entry deals
-      
-      // This is a closed trade (has profit != 0)
-      // For SL/TP hits, deal.order = 0, so we need to match by symbol/volume/time
-      // For manual closes, deal.order > 0 and matches the entry
-      
-      let entryDeal = null;
-      
-      if (deal.order > 0) {
-        // Manual close - order matches entry
-        entryDeal = entryDeals.get(deal.order);
-      }
-      
-      // Create trade record from the exit deal (it has all the info we need)
-      // The deal.price is the close price, deal.type tells us direction
-      const trade = {
-        ticket: deal.order > 0 ? deal.order : `${deal.symbol}_${deal.time}`,
-        symbol: deal.symbol,
-        // For exits: type 0 = closed a SELL (so original was SELL), type 1 = closed a BUY (original was BUY)  
-        // Wait, that's backwards. Let me check the data again...
-        // Looking at the data: entry type 0 = BUY entry, exit type 1 = SELL to close (so original was BUY)
-        // So exit type 1 means original position was BUY, exit type 0 means original was SELL
-        side: deal.type === 1 ? 'BUY' : 'SELL',
-        entryPrice: entryDeal ? entryDeal.price : 0,
-        closePrice: deal.price,
-        volume: deal.volume,
-        profit: deal.profit,
-        pnl: deal.profit,
-        pnlPips: 0, // Calculate below
-        openTime: entryDeal ? new Date(entryDeal.time * 1000).toISOString() : new Date((deal.time - 300) * 1000).toISOString(),
-        closeTime: new Date(deal.time * 1000).toISOString(),
-        status: 'closed',
-        result: deal.profit > 0 ? 'win' : deal.profit < 0 ? 'loss' : 'breakeven',
-        strategy: deal.comment || (entryDeal ? entryDeal.comment : 'Unknown')
-      };
-      
-      // Calculate pips if we have both prices
-      if (trade.entryPrice > 0 && trade.closePrice > 0) {
-        const isXAU = deal.symbol.includes('XAU');
-        const isJPY = deal.symbol.includes('JPY');
-        const pipSize = isXAU ? 0.1 : isJPY ? 0.01 : 0.0001;
-        if (trade.side === 'BUY') {
-          trade.pnlPips = Math.round((trade.closePrice - trade.entryPrice) / pipSize);
-        } else {
-          trade.pnlPips = Math.round((trade.entryPrice - trade.closePrice) / pipSize);
-        }
-      }
-      
-      closedTrades.push(trade);
-    }
-    
+    const closedTrades = parseDealsIntoTrades(data.deals);
     console.log(`📡 Processed ${closedTrades.length} closed trades`);
     
     // Sync to MongoDB (upsert each trade)
@@ -672,48 +861,36 @@ app.get('/api/trades', async (req, res) => {
       return res.json(trades);
     }
     
-    // Fallback: get trades directly from MT5 history (only for closed trades)
+    // Fallback: get trades directly from MT5 history and sync to MongoDB
     if (!status || status === 'closed' || status === 'all') {
-      console.log('📡 MongoDB empty or not connected, fetching from MT5...');
+      console.log('📡 MongoDB empty, fetching from MT5 and syncing...');
       try {
-        const historyResponse = await fetch(`${MT5_BRIDGE_URL}/deals?since=${Math.floor(Date.now() / 1000) - 86400 * 7}`);
+        const since = Math.floor(Date.now() / 1000) - 86400 * 7;
+        const historyResponse = await fetch(`${MT5_BRIDGE_URL}/deals?since=${since}`);
         const historyData = await historyResponse.json();
         
         if (historyData.deals && historyData.deals.length > 0) {
-          // Parse deals into trades (same logic as /api/history)
-          const closedTrades = [];
-          const entryDeals = new Map();
+          // Use the shared parsing function
+          let closedTrades = parseDealsIntoTrades(historyData.deals);
           
-          for (const deal of historyData.deals) {
-            if (!deal.symbol || deal.symbol === '') continue;
-            if (deal.profit === 0 && deal.order > 0 && deal.volume > 0) {
-              entryDeals.set(deal.order, deal);
-            }
+          // Filter by symbol if specified
+          if (symbol) {
+            closedTrades = closedTrades.filter(t => t.symbol.includes(symbol));
           }
           
-          for (const deal of historyData.deals) {
-            if (!deal.symbol || deal.symbol === '') continue;
-            if (deal.profit === 0) continue;
-            if (symbol && !deal.symbol.includes(symbol)) continue;
-            
-            const entryDeal = deal.order > 0 ? entryDeals.get(deal.order) : null;
-            
-            closedTrades.push({
-              _id: `mt5_${deal.order || deal.time}_${deal.symbol}`,
-              ticket: deal.order > 0 ? deal.order : `${deal.symbol}_${deal.time}`,
-              symbol: deal.symbol,
-              side: deal.type === 1 ? 'BUY' : 'SELL',
-              entryPrice: entryDeal ? entryDeal.price : 0,
-              closePrice: deal.price,
-              volume: deal.volume,
-              profit: deal.profit,
-              pnl: deal.profit,
-              openTime: entryDeal ? new Date(entryDeal.time * 1000).toISOString() : new Date((deal.time - 300) * 1000).toISOString(),
-              closeTime: new Date(deal.time * 1000).toISOString(),
-              status: 'closed',
-              result: deal.profit > 0 ? 'win' : deal.profit < 0 ? 'loss' : 'breakeven',
-              strategy: deal.comment || 'Unknown'
-            });
+          // Sync to MongoDB in background
+          const db = getDB();
+          if (db) {
+            for (const trade of closedTrades) {
+              try {
+                await db.collection('trades').updateOne(
+                  { ticket: trade.ticket },
+                  { $set: { ...trade, updatedAt: new Date() } },
+                  { upsert: true }
+                );
+              } catch (e) {}
+            }
+            console.log(`📊 Synced ${closedTrades.length} trades to MongoDB`);
           }
           
           // Sort by closeTime descending

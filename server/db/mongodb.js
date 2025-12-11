@@ -20,7 +20,8 @@ export async function connectDB() {
   // List of connection configurations to try
   const configs = [
     { name: 'default', options: { serverSelectionTimeoutMS: 10000 } },
-    { name: 'TLS1.2 min', options: { serverSelectionTimeoutMS: 10000, tls: true, minTlsVersion: 'TLSv1.2' } },
+    { name: 'legacy SSL', options: { serverSelectionTimeoutMS: 10000, ssl: true } },
+    { name: 'TLS with CA', options: { serverSelectionTimeoutMS: 10000, tls: true, tlsInsecure: true } },
     { name: 'allow invalid', options: { serverSelectionTimeoutMS: 10000, tls: true, tlsAllowInvalidCertificates: true } },
   ];
 

@@ -60,19 +60,19 @@ interface LiveSetups {
 const SERVER_URL = '';
 
 const statusColors: Record<string, string> = {
-  scanning: 'bg-blue-500/20 text-blue-300 border-blue-500',
-  sweep_detected: 'bg-yellow-500/20 text-yellow-300 border-yellow-500',
-  fvg_formed: 'bg-purple-500/20 text-purple-300 border-purple-500',
-  waiting_entry: 'bg-orange-500/20 text-orange-300 border-orange-500',
-  ready: 'bg-orange-500/20 text-orange-300 border-orange-500',
-  continuation: 'bg-cyan-500/20 text-cyan-300 border-cyan-500',
-  trend_entry: 'bg-indigo-500/20 text-indigo-300 border-indigo-500',
-  pattern_entry: 'bg-pink-500/20 text-pink-300 border-pink-500',
-  pending_order: 'bg-lime-500/20 text-lime-300 border-lime-500',
-  triggered: 'bg-green-500/20 text-green-300 border-green-500',
-  expired: 'bg-gray-500/20 text-gray-300 border-gray-500',
-  skipped: 'bg-red-500/20 text-red-300 border-red-500',
-  invalidated: 'bg-red-600/20 text-red-400 border-red-600',
+  scanning: 'bg-gray-700/30 text-gray-400 border-gray-600/50',
+  sweep_detected: 'bg-amber-900/20 text-amber-400/80 border-amber-700/40',
+  fvg_formed: 'bg-purple-900/20 text-purple-400/80 border-purple-700/40',
+  waiting_entry: 'bg-orange-900/20 text-orange-400/80 border-orange-700/40',
+  ready: 'bg-orange-900/20 text-orange-400/80 border-orange-700/40',
+  continuation: 'bg-cyan-900/20 text-cyan-400/80 border-cyan-700/40',
+  trend_entry: 'bg-indigo-900/20 text-indigo-400/80 border-indigo-700/40',
+  pattern_entry: 'bg-pink-900/20 text-pink-400/80 border-pink-700/40',
+  pending_order: 'bg-lime-900/20 text-lime-400/80 border-lime-700/40',
+  triggered: 'bg-emerald-900/20 text-emerald-400/80 border-emerald-700/40',
+  expired: 'bg-gray-800/30 text-gray-500 border-gray-700/40',
+  skipped: 'bg-red-900/20 text-red-400/70 border-red-800/40',
+  invalidated: 'bg-red-900/20 text-red-400/70 border-red-800/40',
 };
 
 const statusLabels: Record<string, string> = {
@@ -91,49 +91,70 @@ const statusLabels: Record<string, string> = {
   invalidated: 'Invalid',
 };
 
-function SetupCard({ symbol, setup, openTrade }: { symbol: string; setup: Setup | null; openTrade?: OpenTrade | null }) {
+function SetupCard({ symbol, setup, openTrade, isDisabled }: { symbol: string; setup: Setup | null; openTrade?: OpenTrade | null; isDisabled?: boolean }) {
+  // If symbol is disabled, show disabled overlay
+  if (isDisabled) {
+    return (
+      <div className="bg-gray-800/20 rounded-lg p-4 border border-gray-700/30 min-h-[120px] relative overflow-hidden">
+        {/* Disabled overlay */}
+        <div className="absolute inset-0 bg-gray-900/80 flex flex-col items-center justify-center z-10">
+          <div className="text-gray-500 font-semibold text-sm">DISABLED</div>
+          <div className="text-gray-600 text-xs mt-1">Until January 2025</div>
+        </div>
+        {/* Background card */}
+        <div className="opacity-20">
+          <div className="flex items-center justify-between mb-3">
+            <h3 className="text-lg font-bold text-gray-400">{symbol.replace('z', '')}</h3>
+            <span className="px-2 py-1 text-xs rounded bg-gray-800 text-gray-500">Paused</span>
+          </div>
+          <div className="text-gray-700 text-sm">Trading paused for December</div>
+        </div>
+      </div>
+    );
+  }
+  
   // If there's an open trade (must have ticket to be valid), show that instead
   if (openTrade && openTrade.ticket) {
-    const pnlColor = (openTrade.unrealizedPips || 0) >= 0 ? 'text-green-400' : 'text-red-400';
+    const pnlColor = (openTrade.unrealizedPips || 0) >= 0 ? 'text-emerald-400' : 'text-red-400';
     return (
-      <div className={`bg-gray-800/50 rounded-lg p-2 border min-h-[120px] ${openTrade.side === 'BUY' ? 'border-green-600' : 'border-red-600'}`}>
+      <div className={`bg-gray-800/30 rounded-lg p-2 border min-h-[120px] border-gray-600/40`}>
         {/* Header */}
         <div className="flex items-center justify-between mb-2">
           <div className="flex items-center gap-2">
-            <h3 className="text-lg font-bold text-white">{symbol.replace('z', '')}</h3>
-            <span className={`px-1.5 py-0.5 text-xs font-bold rounded ${openTrade.side === 'BUY' ? 'bg-green-600 text-white' : 'bg-red-600 text-white'}`}>
+            <h3 className="text-lg font-bold text-gray-200">{symbol.replace('z', '')}</h3>
+            <span className={`px-1.5 py-0.5 text-xs font-bold rounded ${openTrade.side === 'BUY' ? 'bg-gray-600/50 text-gray-300' : 'bg-gray-600/50 text-gray-300'}`}>
               {openTrade.side}
             </span>
           </div>
-          <span className="px-2 py-1 text-xs rounded bg-emerald-600/30 text-emerald-300 border border-emerald-500 animate-pulse">
-            🟢 LIVE TRADE
+          <span className="px-2 py-1 text-xs rounded bg-gray-700/50 text-gray-400 border border-gray-600/50">
+            ● LIVE
           </span>
         </div>
         
         {/* Live P/L */}
-        <div className="bg-gray-900 rounded p-3 mb-2">
+        <div className="bg-black/20 rounded p-3 mb-2">
           <div className="flex justify-between items-center mb-2">
-            <span className="text-gray-400 text-sm">Unrealized P/L</span>
+            <span className="text-gray-600 text-sm">Unrealized P/L</span>
             <span className={`text-xl font-bold ${pnlColor}`}>
               {(openTrade.unrealizedPips || 0) >= 0 ? '+' : ''}{(openTrade.unrealizedPips || 0).toFixed(1)} pips
             </span>
           </div>
           <div className="grid grid-cols-2 gap-2 text-xs">
             <div>
-              <span className="text-gray-500">Entry:</span>
-              <span className="text-yellow-400 ml-1">{openTrade.entryPrice?.toFixed(5)}</span>
+              <span className="text-gray-600">Entry:</span>
+              <span className="text-gray-400 ml-1">{openTrade.entryPrice?.toFixed(5)}</span>
             </div>
             <div>
-              <span className="text-gray-500">Current:</span>
-              <span className="text-blue-400 ml-1">{openTrade.currentPrice?.toFixed(5)}</span>
+              <span className="text-gray-600">Current:</span>
+              <span className="text-gray-400 ml-1">{openTrade.currentPrice?.toFixed(5)}</span>
             </div>
             <div>
-              <span className="text-gray-500">SL:</span>
-              <span className="text-red-400 ml-1">{openTrade.sl?.toFixed(5)}</span>
+              <span className="text-gray-600">SL:</span>
+              <span className="text-gray-500 ml-1">{openTrade.sl?.toFixed(5)}</span>
             </div>
             <div>
-              <span className="text-gray-500">TP:</span>
-              <span className="text-green-400 ml-1">{openTrade.tp?.toFixed(5)}</span>
+              <span className="text-gray-600">TP:</span>
+              <span className="text-gray-500 ml-1">{openTrade.tp?.toFixed(5)}</span>
             </div>
           </div>
         </div>
@@ -148,12 +169,12 @@ function SetupCard({ symbol, setup, openTrade }: { symbol: string; setup: Setup 
   
   if (!setup) {
     return (
-      <div className="bg-gray-800/50 rounded-lg p-4 border border-gray-700 min-h-[120px]">
+      <div className="bg-gray-800/30 rounded-lg p-4 border border-gray-700/30 min-h-[120px]">
         <div className="flex items-center justify-between mb-3">
-          <h3 className="text-lg font-bold text-white">{symbol.replace('z', '')}</h3>
-          <span className="px-2 py-1 text-xs rounded bg-gray-700 text-gray-400">No Setup</span>
+          <h3 className="text-lg font-bold text-gray-300">{symbol.replace('z', '')}</h3>
+          <span className="px-2 py-1 text-xs rounded bg-gray-800/50 text-gray-500 border border-gray-700/50">No Setup</span>
         </div>
-        <div className="text-gray-500 text-sm">Waiting for signal...</div>
+        <div className="text-gray-600 text-sm">Waiting for signal...</div>
       </div>
     );
   }
@@ -164,13 +185,13 @@ function SetupCard({ symbol, setup, openTrade }: { symbol: string; setup: Setup 
   const isTrendMode = setup.tradingMode === 'trend';
 
   return (
-    <div className={`bg-gray-800/50 rounded-lg p-2 border min-h-[120px] ${setup.side === 'BUY' ? 'border-green-600' : setup.side === 'SELL' ? 'border-red-600' : 'border-gray-700'}`}>
+    <div className={`bg-gray-800/30 rounded-lg p-2 border backdrop-blur-md min-h-[120px] border-gray-600/40`}>
       {/* Header */}
       <div className="flex items-center justify-between mb-3">
         <div className="flex items-center gap-2">
-          <h3 className="text-lg font-bold text-white">{symbol.replace('z', '')}</h3>
+          <h3 className="text-lg font-bold text-gray-200">{symbol.replace('z', '')}</h3>
           {setup.side && (
-            <span className={`px-1.5 py-0.5 text-xs font-bold rounded ${setup.side === 'BUY' ? 'bg-green-600 text-white' : 'bg-red-600 text-white'}`}>
+            <span className={`px-1.5 py-0.5 text-xs font-bold rounded bg-gray-600/50 text-gray-300`}>
               {setup.side}
             </span>
           )}
@@ -178,12 +199,12 @@ function SetupCard({ symbol, setup, openTrade }: { symbol: string; setup: Setup 
         <div className="flex items-center gap-1">
           {/* Trading Mode Badge */}
           {isSweepMode && (
-            <span className="px-1.5 py-0.5 text-xs rounded bg-amber-600/30 text-amber-300 border border-amber-600">
+            <span className="px-1.5 py-0.5 text-xs rounded bg-black-700/30 text-yellow-400 border border-gray-600/40">
               SWEEP {setup.sweepTimeRemaining ? `${setup.sweepTimeRemaining}m` : ''}
             </span>
           )}
           {isTrendMode && (
-            <span className="px-1.5 py-0.5 text-xs rounded bg-violet-600/30 text-violet-300 border border-violet-600">
+            <span className="px-1.5 py-0.5 text-xs rounded bg-yellow-700/30 text-gray-400 border border-gray-600/40">
               TREND
             </span>
           )}
@@ -196,35 +217,35 @@ function SetupCard({ symbol, setup, openTrade }: { symbol: string; setup: Setup 
       {/* Price Levels Visualization */}
       {setup.entryPrice && setup.sl && setup.tp && (
         <div className="mb-4 relative">
-          <div className="text-xs text-gray-400 mb-2">Price Levels</div>
-          <div className="bg-gray-900 rounded p-3 space-y-2">
+          <div className="text-xs text-gray-600 mb-2">Price Levels</div>
+          <div className="bg-black/20 rounded p-3 space-y-2">
             {/* TP */}
             <div className="flex justify-between items-center">
-              <span className="text-green-400 text-xs">TP</span>
-              <span className="text-green-400 font-mono text-sm">{setup.tp.toFixed(5)}</span>
-              {setup.tpPips && <span className="text-green-300 text-xs">+{setup.tpPips.toFixed(1)} pips</span>}
+              <span className="text-gray-500 text-xs">TP</span>
+              <span className="text-gray-400 font-mono text-sm">{setup.tp.toFixed(5)}</span>
+              {setup.tpPips && <span className="text-gray-500 text-xs">+{setup.tpPips.toFixed(1)} pips</span>}
             </div>
             
             {/* Entry */}
-            <div className="flex justify-between items-center border-y border-gray-700 py-2">
-              <span className="text-yellow-400 text-xs">ENTRY</span>
-              <span className="text-yellow-400 font-mono text-sm font-bold">{setup.entryPrice.toFixed(5)}</span>
-              <span className="text-gray-400 text-xs">→</span>
+            <div className="flex justify-between items-center border-y border-gray-800/50 py-2">
+              <span className="text-gray-500 text-xs">ENTRY</span>
+              <span className="text-gray-300 font-mono text-sm font-bold">{setup.entryPrice.toFixed(5)}</span>
+              <span className="text-gray-600 text-xs">→</span>
             </div>
             
             {/* Current Price */}
             {setup.currentPrice && (
               <div className="flex justify-between items-center">
-                <span className="text-blue-400 text-xs">NOW</span>
-                <span className="text-blue-400 font-mono text-sm">{setup.currentPrice.toFixed(5)}</span>
+                <span className="text-gray-500 text-xs">NOW</span>
+                <span className="text-gray-400 font-mono text-sm">{setup.currentPrice.toFixed(5)}</span>
               </div>
             )}
             
             {/* SL */}
             <div className="flex justify-between items-center">
-              <span className="text-red-400 text-xs">SL</span>
-              <span className="text-red-400 font-mono text-sm">{setup.sl.toFixed(5)}</span>
-              {setup.slPips && <span className="text-red-300 text-xs">-{setup.slPips.toFixed(1)} pips</span>}
+              <span className="text-gray-500 text-xs">SL</span>
+              <span className="text-gray-400 font-mono text-sm">{setup.sl.toFixed(5)}</span>
+              {setup.slPips && <span className="text-gray-500 text-xs">-{setup.slPips.toFixed(1)} pips</span>}
             </div>
           </div>
         </div>
@@ -233,11 +254,11 @@ function SetupCard({ symbol, setup, openTrade }: { symbol: string; setup: Setup 
       {/* FVG Zone */}
       {setup.fvgHigh && setup.fvgLow && (
         <div className="mb-3">
-          <div className="text-xs text-gray-400 mb-1">FVG Zone ({setup.fvgSide})</div>
-          <div className="bg-purple-900/30 rounded px-3 py-2 border border-purple-700">
+          <div className="text-xs text-gray-600 mb-1">FVG Zone ({setup.fvgSide})</div>
+          <div className="bg-gray-800/30 rounded px-3 py-2 border border-gray-700/30">
             <div className="flex justify-between text-sm">
-              <span className="text-purple-300">High: {setup.fvgHigh.toFixed(5)}</span>
-              <span className="text-purple-300">Low: {setup.fvgLow.toFixed(5)}</span>
+              <span className="text-gray-400">High: {setup.fvgHigh.toFixed(5)}</span>
+              <span className="text-gray-400">Low: {setup.fvgLow.toFixed(5)}</span>
             </div>
           </div>
         </div>
@@ -246,13 +267,13 @@ function SetupCard({ symbol, setup, openTrade }: { symbol: string; setup: Setup 
       {/* Sweep Info */}
       {setup.sweepLevel && (
         <div className="mb-3">
-          <div className="text-xs text-gray-400 mb-1">Sweep</div>
+          <div className="text-xs text-gray-600 mb-1">Sweep</div>
           <div className="flex justify-between text-sm">
-            <span className="text-orange-300">Level: {setup.sweepLevel.toFixed(5)}</span>
-            {setup.sweepPips && <span className="text-orange-300">{setup.sweepPips.toFixed(1)} pips</span>}
+            <span className="text-gray-400">Level: {setup.sweepLevel.toFixed(5)}</span>
+            {setup.sweepPips && <span className="text-gray-500">{setup.sweepPips.toFixed(1)} pips</span>}
           </div>
           {setup.sweepCandlesAgo !== undefined && (
-            <div className="text-xs text-gray-500 mt-1">
+            <div className="text-xs text-gray-600 mt-1">
               {setup.sweepCandlesAgo} candles ago (max: {setup.maxCandlesToWait})
             </div>
           )}
@@ -262,18 +283,18 @@ function SetupCard({ symbol, setup, openTrade }: { symbol: string; setup: Setup 
       {/* Pending Order Info */}
       {setup.pendingOrderTicket && (
         <div className="mb-3">
-          <div className="text-xs text-gray-400 mb-1">Pending Order</div>
-          <div className="bg-lime-900/30 rounded px-3 py-2 border border-lime-600">
+          <div className="text-xs text-gray-600 mb-1">Pending Order</div>
+          <div className="bg-gray-800/30 rounded px-3 py-2 border border-gray-700/30">
             <div className="flex justify-between text-sm">
-              <span className="text-lime-300 font-bold">{setup.pendingOrderType}</span>
-              <span className="text-lime-400">#{setup.pendingOrderTicket}</span>
+              <span className="text-gray-300 font-bold">{setup.pendingOrderType}</span>
+              <span className="text-gray-400">#{setup.pendingOrderTicket}</span>
             </div>
             {setup.pendingOrderPlacedAt && (
-              <div className="text-xs text-lime-400/70 mt-1">
+              <div className="text-xs text-gray-500 mt-1">
                 Placed: {new Date(setup.pendingOrderPlacedAt).toLocaleTimeString()}
               </div>
             )}
-            <div className="text-xs text-gray-400 mt-1">
+            <div className="text-xs text-gray-600 mt-1">
               Waiting for price to reach entry...
             </div>
           </div>
@@ -283,14 +304,14 @@ function SetupCard({ symbol, setup, openTrade }: { symbol: string; setup: Setup 
       {/* Asian Range (XAU) */}
       {setup.asianHigh && setup.asianLow && (
         <div className="mb-3">
-          <div className="text-xs text-gray-400 mb-1">Asian Range</div>
-          <div className="bg-cyan-900/30 rounded px-3 py-2 border border-cyan-700">
+          <div className="text-xs text-gray-600 mb-1">Asian Range</div>
+          <div className="bg-gray-800/30 rounded px-3 py-2 border border-gray-700/30">
             <div className="flex justify-between text-sm">
-              <span className="text-cyan-300">High: {setup.asianHigh.toFixed(2)}</span>
-              <span className="text-cyan-300">Low: {setup.asianLow.toFixed(2)}</span>
+              <span className="text-gray-400">High: {setup.asianHigh.toFixed(2)}</span>
+              <span className="text-gray-400">Low: {setup.asianLow.toFixed(2)}</span>
             </div>
             {setup.asianRangePips && (
-              <div className="text-xs text-cyan-400 mt-1">Range: {setup.asianRangePips.toFixed(1)} pips</div>
+              <div className="text-xs text-gray-500 mt-1">Range: {setup.asianRangePips.toFixed(1)} pips</div>
             )}
           </div>
         </div>
@@ -298,9 +319,9 @@ function SetupCard({ symbol, setup, openTrade }: { symbol: string; setup: Setup 
 
       {/* Trend Info */}
       {setup.trend && (
-        <div className="flex items-center gap-2 text-xs text-gray-400 mb-2">
+        <div className="flex items-center gap-2 text-xs text-gray-600 mb-2">
           <span>Trend:</span>
-          <span className={setup.trend === 'BUY' ? 'text-green-400' : 'text-red-400'}>
+          <span className="text-gray-400">
             {setup.trend} {setup.emaSeparationPips && `(${setup.emaSeparationPips.toFixed(1)} pips sep)`}
           </span>
         </div>
@@ -308,7 +329,7 @@ function SetupCard({ symbol, setup, openTrade }: { symbol: string; setup: Setup 
 
       {/* Skip Reason */}
       {setup.skipReason && (
-        <div className="text-xs text-red-400 mt-2">
+        <div className="text-xs text-gray-500 mt-2">
           Skip: {setup.skipReason}
         </div>
       )}
@@ -323,8 +344,174 @@ function SetupCard({ symbol, setup, openTrade }: { symbol: string; setup: Setup 
   );
 }
 
-// All symbols the bot tracks
-const ALL_SYMBOLS = ['GBPUSDz', 'EURUSDz', 'XAUUSDz', 'USDJPYz', 'AUDUSDz', 'NZDUSDz', 'USDCADz', 'EURJPYz'];
+// All symbols the bot tracks (including disabled ones for display)
+const ALL_SYMBOLS = ['GBPUSDz', 'EURUSDz', 'XAUUSDz', 'USDJPYz', 'AUDUSDz', 'NZDUSDz', 'USDCADz', 'EURJPYz', 'US30z', 'NAS100z'];
+
+// Symbols temporarily disabled (XAU and indices until January)
+const DISABLED_SYMBOLS = ['XAUUSDz', 'US30z', 'NAS100z'];
+
+// RiskInput Component - MUST be defined outside RiskControl to prevent recreation on every render
+function RiskInput({ 
+  label, 
+  value, 
+  category, 
+  disabled = false,
+  loading,
+  onUpdate
+}: { 
+  label: string; 
+  value: number; 
+  category: 'riskFX' | 'riskXAU' | 'riskIndices';
+  disabled?: boolean;
+  loading: boolean;
+  onUpdate: (category: 'riskFX' | 'riskXAU' | 'riskIndices', val: number) => void;
+}) {
+  const [inputValue, setInputValue] = useState(value.toString());
+  const [isEditing, setIsEditing] = useState(false);
+  const inputRef = useRef<HTMLInputElement>(null);
+  
+  useEffect(() => {
+    // Only update from parent if not currently editing AND input is not focused
+    if (!isEditing && document.activeElement !== inputRef.current) {
+      setInputValue(value.toString());
+    }
+  }, [value, isEditing]);
+  
+  const handleApply = () => {
+    const val = parseFloat(inputValue);
+    if (!isNaN(val) && val !== value) {
+      onUpdate(category, val);
+    }
+    setIsEditing(false);
+  };
+  
+  return (
+    <div className={`flex items-center gap-2 ${disabled ? 'opacity-50' : ''}`}>
+      <span className="text-gray-400 text-xs w-16">{label}</span>
+      <button
+        onClick={() => !disabled && onUpdate(category, Math.round(Math.max(0.5, value - 0.1) * 10) / 10)}
+        disabled={loading || disabled || value <= 0.5}
+        className="w-6 h-6 flex items-center justify-center bg-gray-700/50 hover:bg-gray-600/50 border border-gray-600 rounded text-gray-300 text-sm disabled:opacity-30 disabled:cursor-not-allowed"
+      >
+        -
+      </button>
+      <input
+        ref={inputRef}
+        type="text"
+        value={inputValue}
+        onChange={(e) => setInputValue(e.target.value)}
+        onFocus={() => setIsEditing(true)}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter' && !disabled) {
+            handleApply();
+            (e.target as HTMLInputElement).blur();
+          }
+          if (e.key === 'Escape') {
+            setInputValue(value.toString());
+            setIsEditing(false);
+            (e.target as HTMLInputElement).blur();
+          }
+        }}
+        onBlur={() => {
+          // Small delay to allow the value to be properly set before applying
+          setTimeout(() => {
+            handleApply();
+          }, 100);
+        }}
+        disabled={disabled}
+        className="w-14 px-2 py-1 bg-black/30 border border-gray-600 rounded text-center text-white text-sm disabled:cursor-not-allowed"
+      />
+      <span className="text-gray-500 text-xs">%</span>
+      <button
+        onClick={() => !disabled && onUpdate(category, Math.round(Math.min(20, value + 0.1) * 10) / 10)}
+        disabled={loading || disabled || value >= 20}
+        className="w-6 h-6 flex items-center justify-center bg-gray-700/50 hover:bg-gray-600/50 border border-gray-600 rounded text-gray-300 text-sm disabled:opacity-30 disabled:cursor-not-allowed"
+      >
+        +
+      </button>
+      {disabled && <span className="text-gray-500 text-xs ml-1">Disabled</span>}
+    </div>
+  );
+}
+
+// Risk Control Component - supports per-category risk
+function RiskControl() {
+  const [riskFX, setRiskFX] = useState<number>(5.0);
+  const [riskXAU, setRiskXAU] = useState<number>(3.0);
+  const [riskIndices, setRiskIndices] = useState<number>(3.0);
+  const [loading, setLoading] = useState(false);
+  const [message, setMessage] = useState<string | null>(null);
+
+  // Fetch current risk on mount
+  useEffect(() => {
+    const fetchRisk = async () => {
+      try {
+        const response = await fetch('/api/risk');
+        const data = await response.json();
+        setRiskFX(data.riskFX || 5.0);
+        setRiskXAU(data.riskXAU || 3.0);
+        setRiskIndices(data.riskIndices || 3.0);
+      } catch (err) {
+        console.error('Failed to fetch risk:', err);
+      }
+    };
+    fetchRisk();
+  }, []);
+
+  const updateRisk = async (category: 'riskFX' | 'riskXAU' | 'riskIndices', newRisk: number) => {
+    if (newRisk < 0.5 || newRisk > 20) {
+      setMessage('Risk must be 0.5% - 20%');
+      setTimeout(() => setMessage(null), 3000);
+      return;
+    }
+    
+    setLoading(true);
+    try {
+      const response = await fetch('/api/risk', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ [category]: newRisk })
+      });
+      const data = await response.json();
+      
+      if (data.success) {
+        setRiskFX(data.riskFX);
+        setRiskXAU(data.riskXAU);
+        setRiskIndices(data.riskIndices);
+        const label = category === 'riskFX' ? 'FX' : category === 'riskXAU' ? 'XAU' : 'Indices';
+        setMessage(`${label} risk set to ${newRisk}%`);
+      } else {
+        setMessage(data.error || 'Failed to update');
+      }
+    } catch (err) {
+      console.error('Risk update error:', err);
+      setMessage('Server offline');
+    }
+    setLoading(false);
+    setTimeout(() => setMessage(null), 3000);
+  };
+
+  return (
+    <div className="bg-gray-800/30 backdrop-blur-sm rounded-lg p-3 border border-gray-700/50">
+      <div className="flex items-center justify-between mb-3">
+        <span className="text-gray-300 text-sm font-medium">Risk Per Trade</span>
+        {message && (
+          <span className={`text-xs ${message.includes('set') ? 'text-green-400' : 'text-yellow-400'}`}>
+            {message}
+          </span>
+        )}
+      </div>
+      <div className="space-y-2">
+        <RiskInput label="FX" value={riskFX} category="riskFX" loading={loading} onUpdate={updateRisk} />
+        <RiskInput label="Gold" value={riskXAU} category="riskXAU" disabled loading={loading} onUpdate={updateRisk} />
+        <RiskInput label="Indices" value={riskIndices} category="riskIndices" disabled loading={loading} onUpdate={updateRisk} />
+      </div>
+      <div className="mt-2 text-xs text-gray-500">
+        Gold & Indices disabled
+      </div>
+    </div>
+  );
+}
 
 export default function SetupVisualization() {
   const [setups, setSetups] = useState<LiveSetups>(() => {
@@ -563,23 +750,34 @@ export default function SetupVisualization() {
   }, []);
 
   return (
-    <div className="bg-gray-900 rounded-xl border border-gray-800 overflow-hidden">
+    <div className="bg-gray-900/60 backdrop-blur-sm rounded-xl border border-gray-700/50 overflow-hidden">
       {/* Header */}
-      <div className="bg-gray-800 px-4 py-3 border-b border-gray-700 flex items-center justify-between">
+      <div className="bg-gray-800/50 px-4 py-3 border-b border-gray-700/50 flex items-center justify-between">
         <div className="flex items-center gap-2">
-          <span className="text-xs font-bold bg-purple-700 px-2 py-1 rounded text-white">LIVE</span>
-          <h2 className="text-lg font-semibold text-white">Live Setups</h2>
+          <span className="text-xs font-bold bg-gray-700 px-2 py-1 rounded text-gray-300">LIVE</span>
+          <h2 className="text-lg font-semibold text-gray-200">Live Setups</h2>
         </div>
-        <div className={`flex items-center gap-2 text-xs ${connected ? 'text-green-400' : 'text-red-400'}`}>
-          <span className={`w-2 h-2 rounded-full ${connected ? 'bg-green-400' : 'bg-red-400'}`}></span>
+        <div className={`flex items-center gap-2 text-xs ${connected ? 'text-emerald-400' : 'text-red-400'}`}>
+          <span className={`w-2 h-2 rounded-full ${connected ? 'bg-emerald-400' : 'bg-red-400'}`}></span>
           {connected ? 'Connected' : 'Disconnected'}
         </div>
+      </div>
+
+      {/* Risk Control Panel */}
+      <div className="px-4 pt-4">
+        <RiskControl />
       </div>
 
       {/* Setup Cards */}
       <div className="p-4 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 auto-rows-fr">
         {Object.entries(setups).map(([symbol, setup]) => (
-          <SetupCard key={symbol} symbol={symbol} setup={setup} openTrade={openTrades[symbol]} />
+          <SetupCard 
+            key={symbol} 
+            symbol={symbol} 
+            setup={setup} 
+            openTrade={openTrades[symbol]} 
+            isDisabled={DISABLED_SYMBOLS.includes(symbol)}
+          />
         ))}
       </div>
     </div>

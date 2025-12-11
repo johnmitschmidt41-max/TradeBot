@@ -176,18 +176,18 @@ const LogEntry = ({ entry }: { entry: LogEntry }) => {
   };
   
   return (
-    <div className="mb-3 font-mono text-xs text-left bg-gray-900/50 rounded p-3 border border-gray-800 overflow-x-auto max-w-full">
+    <div className="mb-3 font-mono text-xs text-left bg-gray-800/40 rounded p-3 border border-gray-700/40 overflow-x-auto max-w-full">
       {/* Decision header (terminal-like) */}
       {isDecision && (
         <div className="mb-2">
-          <div className="text-cyan-400">{String('═').repeat(60)}</div>
-          <div className="text-purple-300 font-bold uppercase text-sm mt-1 mb-1">MODEL DECISION</div>
-          <div className="text-cyan-400">{String('─').repeat(60)}</div>
+          <div className="text-gray-600">{String('═').repeat(60)}</div>
+          <div className="text-purple-400 font-bold uppercase text-sm mt-1 mb-1">MODEL DECISION</div>
+          <div className="text-gray-600">{String('─').repeat(60)}</div>
         </div>
       )}
       {/* Header */}
       <div className="flex items-center gap-2 mb-2">
-        <span className="text-gray-500">[{entry.timestamp}]</span>
+        <span className="text-gray-600">[{entry.timestamp}]</span>
         <span className={`px-2 py-0.5 rounded border font-semibold text-xs ${levelBadgeColor}`}>
           {entry.level}
         </span>
@@ -196,7 +196,7 @@ const LogEntry = ({ entry }: { entry: LogEntry }) => {
       
       {/* JSON Data */}
       {entry.data && Object.keys(entry.data).length > 0 && (
-        <div className="mt-2 pl-4 border-l-2 border-gray-700 text-gray-300 overflow-x-auto break-all max-w-full">
+        <div className="mt-2 pl-4 border-l border-gray-700/50 text-gray-400 overflow-x-auto break-all max-w-full">
           <pre className="whitespace-pre-wrap break-all">{JSON.stringify(entry.data, null, 2)}</pre>
         </div>
       )}
@@ -297,16 +297,15 @@ const LogBox = ({ title, color, fullWidth = false }: LogBoxProps) => {
     setLogs([]);
   };
 
-  const statusColor = isConnected ? 'bg-green-500' : 'bg-red-500';
-  const borderColor = color;
+  const statusColor = isConnected ? 'bg-emerald-500' : 'bg-red-500';
 
   return (
-    <div className={`flex flex-col bg-gray-900 rounded-lg border-2 ${borderColor} overflow-hidden ${boxHeight} shadow-xl`}>
+    <div className={`flex flex-col bg-gray-900/60 backdrop-blur-sm rounded-lg border border-gray-700/50 overflow-hidden ${boxHeight}`}>
       {/* Header */}
-      <div className="bg-gray-800 px-4 py-2 border-b border-gray-700 flex items-center justify-between">
+      <div className="bg-gray-800/50 px-4 py-2 border-b border-gray-700/50 flex items-center justify-between">
         <div className="flex items-center gap-2">
-          <h2 className="text-sm font-semibold text-white">{title}</h2>
-          <div className={`w-2 h-2 rounded-full ${statusColor} shadow-lg`}></div>
+          <h2 className="text-sm font-semibold text-gray-200">{title}</h2>
+          <div className={`w-2 h-2 rounded-full ${statusColor}`}></div>
         </div>
         
         {/* Control Buttons */}
@@ -314,7 +313,7 @@ const LogBox = ({ title, color, fullWidth = false }: LogBoxProps) => {
           <button
             onClick={handleStart}
             disabled={isLoading}
-            className="px-2 py-1 text-xs bg-green-600 hover:bg-green-700 disabled:bg-gray-600 text-white rounded transition-colors"
+            className="px-2 py-1 text-xs bg-emerald-600/80 hover:bg-emerald-600 disabled:bg-gray-700 text-white rounded transition-colors"
             title="Start"
           >
             Start
@@ -322,7 +321,7 @@ const LogBox = ({ title, color, fullWidth = false }: LogBoxProps) => {
           <button
             onClick={handleStop}
             disabled={isLoading}
-            className="px-2 py-1 text-xs bg-red-600 hover:bg-red-700 disabled:bg-gray-600 text-white rounded transition-colors"
+            className="px-2 py-1 text-xs bg-red-600/80 hover:bg-red-600 disabled:bg-gray-700 text-white rounded transition-colors"
             title="Stop"
           >
             Stop
@@ -330,14 +329,14 @@ const LogBox = ({ title, color, fullWidth = false }: LogBoxProps) => {
           <button
             onClick={handleRestart}
             disabled={isLoading}
-            className="px-2 py-1 text-xs bg-yellow-600 hover:bg-yellow-700 disabled:bg-gray-600 text-white rounded transition-colors"
+            className="px-2 py-1 text-xs bg-amber-600/80 hover:bg-amber-600 disabled:bg-gray-700 text-white rounded transition-colors"
             title="Restart"
           >
             Restart
           </button>
           <button
             onClick={handleClearLogs}
-            className="px-2 py-1 text-xs bg-gray-600 hover:bg-gray-700 text-white rounded transition-colors"
+            className="px-2 py-1 text-xs bg-gray-700/80 hover:bg-gray-600 text-gray-300 rounded transition-colors"
             title="Clear Logs"
           >
             Clear
@@ -346,9 +345,9 @@ const LogBox = ({ title, color, fullWidth = false }: LogBoxProps) => {
       </div>
 
       {/* Log Container */}
-      <div ref={logContainerRef} className="flex-1 overflow-y-auto p-4 bg-gray-950">
+      <div ref={logContainerRef} className="flex-1 overflow-y-auto p-4 bg-black/40">
         {logs.length === 0 ? (
-          <div className="text-gray-500 text-center py-8">
+          <div className="text-gray-600 text-center py-8">
             {isConnected ? 'Waiting for logs...' : 'Connecting...'}
           </div>
         ) : (
@@ -367,7 +366,7 @@ const LogBox = ({ title, color, fullWidth = false }: LogBoxProps) => {
               return (
                 <div
                   key={idx}
-                  className="text-gray-400 text-xs mb-2 p-2 bg-gray-800 rounded whitespace-pre-wrap break-words"
+                  className="text-gray-400 text-xs mb-2 p-2 bg-gray-800/50 rounded whitespace-pre-wrap break-words"
                 >
                   {log.raw}
                 </div>
@@ -380,7 +379,7 @@ const LogBox = ({ title, color, fullWidth = false }: LogBoxProps) => {
       </div>
 
       {/* Footer */}
-      <div className="bg-gray-800 px-4 py-2 border-t border-gray-700 text-xs text-gray-500">
+      <div className="bg-gray-800/50 px-4 py-2 border-t border-gray-700/50 text-xs text-gray-500">
         {logs.length} logs • Auto-scroll enabled
       </div>
     </div>
@@ -392,33 +391,33 @@ export default function App() {
   const [showControl, setShowControl] = useState(true);
 
   return (
-    <div className="min-h-screen bg-gray-950 p-6">
+    <div className="min-h-screen bg-black p-6">
       {/* Header */}
       <div className="max-w-7xl mx-auto mb-6">
         <div className="flex items-center justify-between">
           <div>
-            <h1 className="text-3xl font-bold bg-gradient-to-r from-blue-400 via-purple-400 to-pink-400 bg-clip-text text-transparent">
+            <h1 className="text-3xl font-bold text-white">
               TradeBot Dashboard
             </h1>
-            <p className="text-gray-400 text-sm mt-1">Real-time monitoring | Live setups | Trade journal</p>
+            <p className="text-gray-500 text-sm mt-1">Real-time monitoring | Live setups | Trade journal</p>
           </div>
           <div className="flex gap-2">
             <button
               onClick={() => setShowControl(!showControl)}
-              className={`px-4 py-2 rounded-lg font-medium transition-all ${
+              className={`px-4 py-2 rounded-lg font-medium transition-all border ${
                 showControl
-                  ? 'bg-purple-600 text-white'
-                  : 'bg-gray-800 text-gray-400 hover:bg-gray-700 hover:text-white'
+                  ? 'bg-gray-800/50 text-white border-gray-600'
+                  : 'bg-transparent text-gray-500 border-gray-700 hover:bg-gray-800/30 hover:text-gray-300'
               }`}
             >
               {showControl ? 'Hide Control' : 'Control Panel'}
             </button>
             <button
               onClick={() => setShowJournal(!showJournal)}
-              className={`px-4 py-2 rounded-lg font-medium transition-all ${
+              className={`px-4 py-2 rounded-lg font-medium transition-all border ${
                 showJournal
-                  ? 'bg-green-600 text-white'
-                  : 'bg-gray-800 text-gray-400 hover:bg-gray-700 hover:text-white'
+                  ? 'bg-gray-800/50 text-white border-gray-600'
+                  : 'bg-transparent text-gray-500 border-gray-700 hover:bg-gray-800/30 hover:text-gray-300'
               }`}
             >
               {showJournal ? 'Hide Journal' : 'Trade Journal'}

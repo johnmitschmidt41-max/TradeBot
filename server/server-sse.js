@@ -211,6 +211,101 @@ app.get('/api/stats', (req, res) => {
   });
 });
 
+// Risk config path
+const riskConfigPath = join(__dirname, '..', '..', 'mainbot', 'data', 'config', 'trading_mode.json');
+
+// GET current risk settings (all categories)
+app.get('/api/risk', (req, res) => {
+  try {
+    if (fs.existsSync(riskConfigPath)) {
+      const config = JSON.parse(fs.readFileSync(riskConfigPath, 'utf8'));
+      res.json({
+        riskFX: config.riskFX || 5.0,
+        riskXAU: config.riskXAU || 3.0,
+        riskIndices: config.riskIndices || 3.0
+      });
+    } else {
+      res.json({ riskFX: 5.0, riskXAU: 3.0, riskIndices: 3.0 });
+    }
+  } catch (err) {
+    console.error('Error reading risk config:', err);
+    res.json({ riskFX: 5.0, riskXAU: 3.0, riskIndices: 3.0 });
+  }
+});
+
+// POST update risk (supports per-category or single value)
+app.post('/api/risk', (req, res) => {
+  try {
+    const { riskFX, riskXAU, riskIndices, riskPercent } = req.body;
+    
+    // Read existing config
+    let config = { mode: 'REAL', riskFX: 5.0, riskXAU: 3.0, riskIndices: 3.0 };
+    if (fs.existsSync(riskConfigPath)) {
+      config = JSON.parse(fs.readFileSync(riskConfigPath, 'utf8'));
+    }
+    
+    // Validate and update each category if provided
+    const validateRisk = (val) => {
+      const risk = parseFloat(val);
+      return !isNaN(risk) && risk >= 0.5 && risk <= 20 ? risk : null;
+    };
+    
+    // Handle legacy single riskPercent (update all categories)
+    if (riskPercent !== undefined) {
+      const risk = validateRisk(riskPercent);
+      if (risk === null) {
+        res.status(400).json({ error: 'Risk must be between 0.5% and 20%' });
+        return;
+      }
+      config.riskFX = risk;
+      config.riskXAU = risk;
+      config.riskIndices = risk;
+    } else {
+      // Update individual categories
+      if (riskFX !== undefined) {
+        const risk = validateRisk(riskFX);
+        if (risk === null) {
+          res.status(400).json({ error: 'FX Risk must be between 0.5% and 20%' });
+          return;
+        }
+        config.riskFX = risk;
+      }
+      
+      if (riskXAU !== undefined) {
+        const risk = validateRisk(riskXAU);
+        if (risk === null) {
+          res.status(400).json({ error: 'XAU Risk must be between 0.5% and 20%' });
+          return;
+        }
+        config.riskXAU = risk;
+      }
+      
+      if (riskIndices !== undefined) {
+        const risk = validateRisk(riskIndices);
+        if (risk === null) {
+          res.status(400).json({ error: 'Indices Risk must be between 0.5% and 20%' });
+          return;
+        }
+        config.riskIndices = risk;
+      }
+    }
+    
+    // Save
+    fs.writeFileSync(riskConfigPath, JSON.stringify(config, null, 2));
+    
+    console.log(`Risk updated: FX=${config.riskFX}%, XAU=${config.riskXAU}%, Indices=${config.riskIndices}%`);
+    res.json({
+      success: true,
+      riskFX: config.riskFX,
+      riskXAU: config.riskXAU,
+      riskIndices: config.riskIndices
+    });
+  } catch (err) {
+    console.error('Error updating risk:', err);
+    res.status(500).json({ error: 'Failed to update risk' });
+  }
+});
+
 // Start server
 app.listen(port, () => {
   console.log(`\n📊 TradeBot Log Server`);
