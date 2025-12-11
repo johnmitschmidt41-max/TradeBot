@@ -19,10 +19,49 @@ import { OrderDatabase, PendingOrderRecord } from "../core/order-db";
 // HELPER: Get correct pip size for symbol
 // ═══════════════════════════════════════════════════════════════════
 
+// Path to trading config (risk, mode, etc.)
+const TRADING_CONFIG_PATH = path.join(__dirname, '..', '..', 'data', 'config', 'trading_mode.json');
+
+// Symbols disabled until January 2025 (XAU too volatile, indices not yet configured)
+const DISABLED_SYMBOLS = ['XAUUSDz', 'US30z', 'NAS100z'];
+
+// Helper to get risk percent for a specific symbol category
+function getRiskForSymbol(symbol: string): number {
+  try {
+    if (fs.existsSync(TRADING_CONFIG_PATH)) {
+      const config = JSON.parse(fs.readFileSync(TRADING_CONFIG_PATH, 'utf8'));
+      const s = symbol.toUpperCase();
+      
+      // Determine category
+      if (s.includes('XAU') || s.includes('GOLD')) {
+        const risk = parseFloat(config.riskXAU);
+        if (!isNaN(risk) && risk >= 0.5 && risk <= 20) return risk;
+      } else if (s.includes('US30') || s.includes('NAS') || s.includes('SPX') || s.includes('DJ')) {
+        const risk = parseFloat(config.riskIndices);
+        if (!isNaN(risk) && risk >= 0.5 && risk <= 20) return risk;
+      } else {
+        // FX pairs
+        const risk = parseFloat(config.riskFX);
+        if (!isNaN(risk) && risk >= 0.5 && risk <= 20) return risk;
+      }
+    }
+  } catch (err) {
+    // Silent fail - use default
+  }
+  return 5.0;  // Default risk percent
+}
+
+// Legacy helper - kept for compatibility but now uses category-based risk
+function getRiskPercent(): number {
+  return getRiskForSymbol('EURUSD');  // Returns FX risk as default
+}
+
 function getPipSize(symbol: string): number {
   const s = symbol.toUpperCase();
   if (s.includes('XAU')) return 0.1;        // Gold: $0.10 per pip
   if (s.includes('JPY')) return 0.01;       // JPY pairs: 0.01 per pip
+  if (s.includes('US30') || s.includes('DJ')) return 1.0;   // Dow: 1 point per pip
+  if (s.includes('NAS') || s.includes('NDX')) return 1.0;   // Nasdaq: 1 point per pip
   return 0.0001;                             // Standard FX: 0.0001 per pip
 }
 
@@ -32,6 +71,65 @@ function isXAUSymbol(symbol: string): boolean {
 
 function isJPYSymbol(symbol: string): boolean {
   return symbol.toUpperCase().includes('JPY');
+}
+
+function isIndicesSymbol(symbol: string): boolean {
+  const s = symbol.toUpperCase();
+  return s.includes('US30') || s.includes('NAS') || s.includes('NDX') || s.includes('SPX') || s.includes('DJ');
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// REJECTION CANDLE DETECTION
+// ═══════════════════════════════════════════════════════════════════
+
+/**
+ * Check if a candle shows rejection from a zone (FVG)
+ * Rejection = wick into zone, but body closed back out in trade direction
+ */
+function isRejectionCandle(
+  candle: Candle,
+  side: 'BUY' | 'SELL',
+  fvgHigh: number,
+  fvgLow: number
+): boolean {
+  const bodyHigh = Math.max(candle.open, candle.close);
+  const bodyLow = Math.min(candle.open, candle.close);
+  const candleRange = candle.high - candle.low;
+  const bodySize = bodyHigh - bodyLow;
+  
+  // Minimum candle size to be valid
+  if (candleRange === 0) return false;
+  
+  // Body should be less than 60% of total range (has decent wick)
+  const bodyRatio = bodySize / candleRange;
+  
+  if (side === 'BUY') {
+    // For BUY: wick went INTO the FVG (low touched or went below fvgHigh)
+    // But candle CLOSED in upper half (bullish rejection)
+    const wickedIntoFVG = candle.low <= fvgHigh;
+    const closedBullish = candle.close > candle.open; // Green candle
+    const closedInUpperHalf = candle.close > (candle.high + candle.low) / 2;
+    
+    // Strong rejection: long lower wick, closed near high
+    const lowerWick = bodyLow - candle.low;
+    const upperWick = candle.high - bodyHigh;
+    const hasLongLowerWick = lowerWick > upperWick * 1.5; // Lower wick 1.5x upper
+    
+    return wickedIntoFVG && (closedBullish || closedInUpperHalf || hasLongLowerWick);
+  } else {
+    // For SELL: wick went INTO the FVG (high touched or went above fvgLow)
+    // But candle CLOSED in lower half (bearish rejection)
+    const wickedIntoFVG = candle.high >= fvgLow;
+    const closedBearish = candle.close < candle.open; // Red candle
+    const closedInLowerHalf = candle.close < (candle.high + candle.low) / 2;
+    
+    // Strong rejection: long upper wick, closed near low
+    const lowerWick = bodyLow - candle.low;
+    const upperWick = candle.high - bodyHigh;
+    const hasLongUpperWick = upperWick > lowerWick * 1.5; // Upper wick 1.5x lower
+    
+    return wickedIntoFVG && (closedBearish || closedInLowerHalf || hasLongUpperWick);
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -82,8 +180,25 @@ interface StrategyConfig {
   };
 }
 
+// Correlated pairs that should not have opposing trades at the same time
+// Format: if you're LONG pair A, don't go SHORT pair B (and vice versa)
+const CORRELATION_PAIRS: { pairA: string; pairB: string; inverse: boolean }[] = [
+  // Strongly correlated (move together) - don't take opposite directions
+  { pairA: 'EURUSD', pairB: 'GBPUSD', inverse: false },   // Both move with USD weakness
+  { pairA: 'AUDUSD', pairB: 'NZDUSD', inverse: false },   // Both commodity currencies
+  // Inversely correlated (move opposite) - don't take same direction  
+  { pairA: 'EURUSD', pairB: 'USDCHF', inverse: true },    // Almost perfect inverse
+  { pairA: 'EURUSD', pairB: 'USDCAD', inverse: true },    // USD on opposite sides
+  { pairA: 'GBPUSD', pairB: 'USDCAD', inverse: true },    // USD on opposite sides
+  { pairA: 'GBPUSD', pairB: 'USDJPY', inverse: true },    // USD on opposite sides
+  { pairA: 'EURUSD', pairB: 'USDJPY', inverse: true },    // USD on opposite sides
+  { pairA: 'AUDUSD', pairB: 'USDCAD', inverse: true },    // USD on opposite sides
+];
+
 const DEFAULT_CONFIG: StrategyConfig = {
-  symbols: ['GBPUSDz', 'EURUSDz', 'XAUUSDz', 'USDJPYz', 'AUDUSDz', 'NZDUSDz', 'USDCADz', 'EURJPYz'],
+  // All tradeable symbols - disabled ones are filtered by DISABLED_SYMBOLS constant
+  // XAUUSDz, US30z, NAS100z disabled for December 2024, re-enable in January
+  symbols: ['GBPUSDz', 'EURUSDz', 'USDJPYz', 'AUDUSDz', 'NZDUSDz', 'USDCADz', 'EURJPYz', 'XAUUSDz', 'US30z', 'NAS100z'],
   entryTimeframe: 'M5',
   riskPercent: 5.0,
   maxTradesPerDay: 20,  // Increased for more symbols
@@ -137,11 +252,16 @@ interface PendingSetup {
   entryPrice: number | null;
   sl: number | null;
   tp: number | null;
-  status: 'waiting_fvg' | 'waiting_entry' | 'ready' | 'continuation' | 'trend_entry' | 'pattern_entry' | 'invalidated' | 'pending_order';
+  status: 'waiting_fvg' | 'waiting_rejection' | 'waiting_entry' | 'ready' | 'continuation' | 'trend_entry' | 'pattern_entry' | 'invalidated' | 'pending_order';
   setupType: SetupType;
   highestAfterSweep?: number;  // Track momentum after sweep
   lowestAfterSweep?: number;
   failedAttempts?: number;     // Track failed sweep/reversal attempts
+  // M5 swing low/high for SL placement and invalidation (tighter, faster trades)
+  m5SwingLow?: number;         // For BUY setups - SL below this, invalidate if broken
+  m5SwingHigh?: number;        // For SELL setups - SL above this, invalidate if broken
+  // M5 structure target for TP
+  m5StructureTP?: number;      // Recent M5 swing high (for BUY) or low (for SELL)
   // Pending order tracking
   pendingOrderTicket?: number;
   pendingOrderType?: string;   // BUY_LIMIT, SELL_LIMIT, BUY_STOP, SELL_STOP
@@ -1178,6 +1298,11 @@ export class SweepFVGStrategy {
     now: Date, 
     activeSessions: SessionName[]
   ): Promise<void> {
+    // Skip disabled symbols (XAU, indices until January)
+    if (DISABLED_SYMBOLS.includes(symbol)) {
+      return;
+    }
+    
     // Skip if this symbol has an open trade (let monitorOpenTrades handle it)
     if (this.openTrades.has(symbol)) {
       // Trade is running - don't look for new setups
@@ -1263,17 +1388,20 @@ export class SweepFVGStrategy {
       const isXAU = symbol.includes('XAU');
       const pipSize = getPipSize(symbol);
       
+      // Get allowed directions based on M15/H1 trend alignment
+      const mtfDirections = await this.getAllowedDirections(symbol);
+      
       if (mode === 'sweep') {
         // SWEEP MODE: Look for session level sweeps
-        await this.lookForSweep(symbol, candles, activeSessions);
+        await this.lookForSweep(symbol, candles, activeSessions, mtfDirections);
         
         // Also check for Double/Triple Top/Bottom patterns when momentum is fading
         if (!this.pendingSetups.has(symbol) && isMomentumFading(candles)) {
-          await this.lookForReversalPattern(symbol, candles, currentPrice);
+          await this.lookForReversalPattern(symbol, candles, currentPrice, mtfDirections);
         }
       } else {
         // TREND MODE: Look for trend continuation entries
-        await this.lookForTrendEntry(symbol, candles, currentPrice, isXAU, pipSize);
+        await this.lookForTrendEntry(symbol, candles, currentPrice, isXAU, pipSize, mtfDirections);
       }
       
       // Send scanning status if no setup found
@@ -1289,7 +1417,8 @@ export class SweepFVGStrategy {
   private async lookForSweep(
     symbol: string,
     candles: Candle[],
-    activeSessions: SessionName[]
+    activeSessions: SessionName[],
+    allowedDirections?: { allowBuy: boolean; allowSell: boolean; m15Trend: string; h1Trend: string }
   ): Promise<void> {
     const isXAU = symbol.includes('XAU');
     const pipSize = getPipSize(symbol);
@@ -1328,6 +1457,15 @@ export class SweepFVGStrategy {
           }
           
           // High swept = look for SELL
+          // Check if SELL is allowed by MTF trend
+          if (allowedDirections && !allowedDirections.allowSell) {
+            info('SWEEP', `${symbol} swept ${session} high but SELL blocked by MTF trend`, {
+              m15: allowedDirections.m15Trend,
+              h1: allowedDirections.h1Trend
+            });
+            continue;
+          }
+          
           info('SWEEP', `${symbol} swept ${session} high`, {
             level: prevLevels.high,
             current: currentPrice,
@@ -1353,6 +1491,15 @@ export class SweepFVGStrategy {
           }
           
           // Low swept = look for BUY
+          // Check if BUY is allowed by MTF trend
+          if (allowedDirections && !allowedDirections.allowBuy) {
+            info('SWEEP', `${symbol} swept ${session} low but BUY blocked by MTF trend`, {
+              m15: allowedDirections.m15Trend,
+              h1: allowedDirections.h1Trend
+            });
+            continue;
+          }
+          
           info('SWEEP', `${symbol} swept ${session} low`, {
             level: prevLevels.low,
             current: currentPrice,
@@ -1622,33 +1769,35 @@ export class SweepFVGStrategy {
       
       if (validFVG) {
         setup.fvg = validFVG;
-        setup.status = 'waiting_entry';
         setup.setupType = 'reversal';
         
-        // Calculate entry, SL, TP
-        this.calculateLevels(setup, isXAU, pipSize);
+        // Get M5 swing level for SL and invalidation (tighter, faster trades)
+        const m5SwingLevel = await this.getM5SwingLevel(symbol, setup.side);
+        if (m5SwingLevel) {
+          if (setup.side === 'BUY') {
+            setup.m5SwingLow = m5SwingLevel;
+          } else {
+            setup.m5SwingHigh = m5SwingLevel;
+          }
+        }
         
-        info('FVG', `${symbol} reversal FVG detected`, {
+        // Get M5 structure TP (recent swing high/low on M5)
+        const m5StructureTP = await this.getM5StructureTP(symbol, setup.side);
+        if (m5StructureTP) {
+          setup.m5StructureTP = m5StructureTP;
+        }
+        
+        // Change to waiting_rejection - don't execute yet!
+        setup.status = 'waiting_rejection';
+        
+        info('FVG', `${symbol} reversal FVG detected - waiting for rejection`, {
           side: setup.side,
           fvgHigh: validFVG.high,
           fvgLow: validFVG.low,
-          entry: setup.entryPrice,
-          sl: setup.sl,
-          tp: setup.tp,
+          m5SwingLevel: m5SwingLevel?.toFixed(isXAU ? 2 : 5),
+          m5StructureTP: m5StructureTP?.toFixed(isXAU ? 2 : 5),
           currentPrice
         });
-        
-        // IMMEDIATELY place pending order now that we have entry/sl/tp
-        // The order type (limit/stop/market) will be determined by current price
-        if (setup.entryPrice && setup.sl && setup.tp) {
-          info('FVG', `${symbol} placing pending order for reversal setup`, {
-            entry: setup.entryPrice,
-            current: currentPrice
-          });
-          await this.executeEntry(setup);
-          this.failedSweepAttempts.set(symbol, 0);
-          return;
-        }
       } else {
         // No reversal FVG - check for CONTINUATION pattern
         // If price continues strongly in sweep direction, look for continuation entry
@@ -1702,6 +1851,164 @@ export class SweepFVGStrategy {
         
         this.pendingSetups.delete(symbol);
         return;
+      }
+    }
+    
+    // Step 1.5: Wait for rejection candle at FVG before entering
+    if (setup.status === 'waiting_rejection' && setup.fvg) {
+      const fvg = setup.fvg;
+      const currentCandle = candles[candles.length - 1];
+      
+      // Check if M5 swing level is broken (invalidation)
+      if (setup.side === 'BUY' && setup.m5SwingLow) {
+        if (currentPrice < setup.m5SwingLow) {
+          warn('INVALIDATED', `${symbol} M5 swing low broken - setup invalidated`, {
+            m5SwingLow: setup.m5SwingLow.toFixed(isXAU ? 2 : 5),
+            currentPrice: currentPrice.toFixed(isXAU ? 2 : 5)
+          });
+          this.pendingSetups.delete(symbol);
+          return;
+        }
+      }
+      if (setup.side === 'SELL' && setup.m5SwingHigh) {
+        if (currentPrice > setup.m5SwingHigh) {
+          warn('INVALIDATED', `${symbol} M5 swing high broken - setup invalidated`, {
+            m5SwingHigh: setup.m5SwingHigh.toFixed(isXAU ? 2 : 5),
+            currentPrice: currentPrice.toFixed(isXAU ? 2 : 5)
+          });
+          this.pendingSetups.delete(symbol);
+          return;
+        }
+      }
+      
+      // Check if price has retested FVG zone AND shows rejection
+      const priceInFVG = (setup.side === 'BUY') 
+        ? (currentCandle.low <= fvg.high)  // For buy, low touched FVG
+        : (currentCandle.high >= fvg.low); // For sell, high touched FVG
+      
+      if (priceInFVG) {
+        // Check for rejection candle
+        const hasRejection = isRejectionCandle(currentCandle, setup.side, fvg.high, fvg.low);
+        
+        if (hasRejection) {
+          info('REJECTION', `${symbol} rejection candle confirmed at FVG!`, {
+            side: setup.side,
+            candleOpen: currentCandle.open.toFixed(isXAU ? 2 : 5),
+            candleClose: currentCandle.close.toFixed(isXAU ? 2 : 5),
+            candleLow: currentCandle.low.toFixed(isXAU ? 2 : 5),
+            candleHigh: currentCandle.high.toFixed(isXAU ? 2 : 5)
+          });
+          
+          // NOW calculate proper levels using M5 swing low for SL
+          setup.status = 'waiting_entry';
+          
+          // Entry at current close (rejection confirmed)
+          setup.entryPrice = currentCandle.close;
+          
+          // SL below M5 swing low (for buys) with small buffer - TIGHTER SL for faster trades
+          const slBuffer = isXAU ? 0.5 : isJPY ? 0.02 : 0.0002; // ~2 pips buffer (tighter)
+          if (setup.side === 'BUY' && setup.m5SwingLow) {
+            setup.sl = setup.m5SwingLow - slBuffer;
+          } else if (setup.side === 'SELL' && setup.m5SwingHigh) {
+            setup.sl = setup.m5SwingHigh + slBuffer;
+          } else {
+            // Fallback to FVG-based SL if M5 not available
+            setup.sl = setup.side === 'BUY' 
+              ? fvg.low - (config.maxSlPips * pipSize)
+              : fvg.high + (config.maxSlPips * pipSize);
+          }
+          
+          // Calculate SL distance in pips
+          const slDistance = Math.abs(setup.entryPrice - setup.sl);
+          const slPips = slDistance / pipSize;
+          
+          // SKIP TRADE: SL too tight (< 5 pips) - not enough room
+          if (slPips < 5) {
+            warn('REJECTION', `${symbol} SL too tight (${slPips.toFixed(1)} pips < 5) - skipping`, {
+              m5SwingLevel: setup.side === 'BUY' ? setup.m5SwingLow : setup.m5SwingHigh
+            });
+            this.pendingSetups.delete(symbol);
+            return;
+          }
+          
+          // SKIP TRADE: SL too wide
+          if (slPips > config.maxSlPips) {
+            warn('REJECTION', `${symbol} SL too wide (${slPips.toFixed(1)} pips) - skipping`, {
+              maxAllowed: config.maxSlPips
+            });
+            this.pendingSetups.delete(symbol);
+            return;
+          }
+          
+          // TP CALCULATION: Use M5 structure TP with 2RR minimum
+          // Step 1: Calculate structure-based TP (M5 swing high/low)
+          let structureTP = setup.m5StructureTP;
+          let structureRR = 0;
+          
+          if (structureTP && setup.entryPrice) {
+            const structureDistance = Math.abs(structureTP - setup.entryPrice);
+            structureRR = structureDistance / slDistance;
+          }
+          
+          // Step 2: Determine final TP based on RR rules
+          // - If structure >= 2RR → use structure TP
+          // - If structure > 1RR but < 2RR → extend to 2RR
+          // - If structure <= 1RR → skip trade
+          
+          let finalRR = 2.0; // Minimum RR
+          
+          if (structureRR > 1) {
+            if (structureRR >= 2) {
+              // Structure gives 2RR or better - use it
+              setup.tp = structureTP!;
+              finalRR = structureRR;
+              info('TP', `${symbol} using structure TP (${structureRR.toFixed(1)}RR)`, {
+                structureTP: structureTP?.toFixed(isXAU ? 2 : 5)
+              });
+            } else {
+              // Structure gives 1.x RR - extend to 2RR
+              setup.tp = setup.side === 'BUY'
+                ? setup.entryPrice + (slDistance * 2.0)
+                : setup.entryPrice - (slDistance * 2.0);
+              finalRR = 2.0;
+              info('TP', `${symbol} structure TP only ${structureRR.toFixed(1)}RR - extending to 2RR`, {
+                structureTP: structureTP?.toFixed(isXAU ? 2 : 5),
+                extendedTP: setup.tp.toFixed(isXAU ? 2 : 5)
+              });
+            }
+          } else {
+            // Structure <= 1RR - SKIP TRADE
+            if (structureTP) {
+              warn('REJECTION', `${symbol} structure TP only ${structureRR.toFixed(1)}RR (<=1) - skipping`, {
+                structureTP: structureTP?.toFixed(isXAU ? 2 : 5),
+                entry: setup.entryPrice.toFixed(isXAU ? 2 : 5),
+                sl: setup.sl.toFixed(isXAU ? 2 : 5)
+              });
+              this.pendingSetups.delete(symbol);
+              return;
+            } else {
+              // No structure TP found - use default 2RR
+              setup.tp = setup.side === 'BUY'
+                ? setup.entryPrice + (slDistance * 2.0)
+                : setup.entryPrice - (slDistance * 2.0);
+              finalRR = 2.0;
+              info('TP', `${symbol} no structure TP found - using default 2RR`);
+            }
+          }
+          
+          info('REJECTION', `${symbol} entry levels calculated`, {
+            entry: setup.entryPrice.toFixed(isXAU ? 2 : 5),
+            sl: setup.sl.toFixed(isXAU ? 2 : 5),
+            tp: setup.tp.toFixed(isXAU ? 2 : 5),
+            slPips: slPips.toFixed(1),
+            rr: finalRR.toFixed(1)
+          });
+          
+          // Execute entry immediately
+          await this.executeEntry(setup);
+          this.failedSweepAttempts.set(symbol, 0);
+          return;
+        }
       }
     }
     
@@ -1790,6 +2097,17 @@ export class SweepFVGStrategy {
       return null;  // Never invalidate pending orders through this check
     }
     
+    // SKIP sweep-level invalidation for waiting_rejection - it uses M15 level instead
+    // (M15 level invalidation is handled in the main loop with m15SwingLow/m15SwingHigh)
+    if (setup.status === 'waiting_rejection') {
+      // Only check time limit for waiting_rejection (60 minutes max)
+      const ageMinutes = (Date.now() - setup.sweepTime.getTime()) / (1000 * 60);
+      if (ageMinutes > 60) {
+        return `waiting for rejection too long (${Math.round(ageMinutes)} min)`;
+      }
+      return null;  // M15 level check is done in processPendingSetup
+    }
+    
     // 1. Price hit SL level (would have been stopped out)
     if (setup.sl) {
       if (setup.side === 'BUY' && currentPrice <= setup.sl) {
@@ -1845,7 +2163,8 @@ export class SweepFVGStrategy {
     candles: Candle[],
     currentPrice: number,
     isXAU: boolean,
-    pipSize: number
+    pipSize: number,
+    allowedDirections?: { allowBuy: boolean; allowSell: boolean; m15Trend: string; h1Trend: string }
   ): Promise<void> {
     // Calculate EMAs for trend direction
     const emaFast = this.calculateEMA(candles, 9);
@@ -1867,6 +2186,24 @@ export class SweepFVGStrategy {
     if (!trendDirection) {
       info('TREND', `${symbol} no clear trend - EMA separation ${emaSeparation.toFixed(1)} pips (need ${minSeparation})`, {});
       return;
+    }
+    
+    // Check if this direction is allowed by MTF
+    if (allowedDirections) {
+      if (trendDirection === 'BUY' && !allowedDirections.allowBuy) {
+        info('TREND', `${symbol} M5 trend is BUY but blocked by MTF`, {
+          m15: allowedDirections.m15Trend,
+          h1: allowedDirections.h1Trend
+        });
+        return;
+      }
+      if (trendDirection === 'SELL' && !allowedDirections.allowSell) {
+        info('TREND', `${symbol} M5 trend is SELL but blocked by MTF`, {
+          m15: allowedDirections.m15Trend,
+          h1: allowedDirections.h1Trend
+        });
+        return;
+      }
     }
     
     // Update trend state
@@ -1956,12 +2293,31 @@ export class SweepFVGStrategy {
   private async lookForReversalPattern(
     symbol: string,
     candles: Candle[],
-    currentPrice: number
+    currentPrice: number,
+    allowedDirections?: { allowBuy: boolean; allowSell: boolean; m15Trend: string; h1Trend: string }
   ): Promise<void> {
     // Detect reversal pattern
     const pattern = detectReversalPattern(candles, symbol);
     
     if (!pattern) return;
+    
+    // Check if this direction is allowed by MTF
+    if (allowedDirections) {
+      if (pattern.side === 'BUY' && !allowedDirections.allowBuy) {
+        info('PATTERN', `${symbol} ${pattern.type} is BUY but blocked by MTF trend`, {
+          m15: allowedDirections.m15Trend,
+          h1: allowedDirections.h1Trend
+        });
+        return;
+      }
+      if (pattern.side === 'SELL' && !allowedDirections.allowSell) {
+        info('PATTERN', `${symbol} ${pattern.type} is SELL but blocked by MTF trend`, {
+          m15: allowedDirections.m15Trend,
+          h1: allowedDirections.h1Trend
+        });
+        return;
+      }
+    }
     
     // Only trade patterns with strength >= 50
     if (pattern.strength < 50) {
@@ -2053,6 +2409,128 @@ export class SweepFVGStrategy {
     }
     
     return ema;
+  }
+
+  /**
+   * Get M5 swing low (for BUY setups) or swing high (for SELL setups)
+   * Looks back ~2 hours (24 M5 candles) to find the significant low/high
+   * This is used for SL placement and invalidation - TIGHTER than M15 for faster trades
+   */
+  private async getM5SwingLevel(symbol: string, side: 'BUY' | 'SELL'): Promise<number | null> {
+    try {
+      // Get last 24 M5 candles (~2 hours) - tighter lookback than M15
+      const m5Candles = await this.dataFeed.getRecentCandles(symbol, 'M5', 24);
+      if (!m5Candles || m5Candles.length < 3) return null;
+      
+      if (side === 'BUY') {
+        // Find the lowest low in the lookback period
+        let lowestLow = m5Candles[0].low;
+        for (const candle of m5Candles) {
+          if (candle.low < lowestLow) {
+            lowestLow = candle.low;
+          }
+        }
+        return lowestLow;
+      } else {
+        // Find the highest high in the lookback period
+        let highestHigh = m5Candles[0].high;
+        for (const candle of m5Candles) {
+          if (candle.high > highestHigh) {
+            highestHigh = candle.high;
+          }
+        }
+        return highestHigh;
+      }
+    } catch (err) {
+      warn('M5', `${symbol} failed to get M5 swing level: ${err}`);
+      return null;
+    }
+  }
+
+  /**
+   * Get M5 structure TP - the recent swing high (for BUY) or swing low (for SELL)
+   * This finds a realistic take profit based on M5 structure
+   * Looks forward in the opposite direction of trade for the TP target
+   */
+  private async getM5StructureTP(symbol: string, side: 'BUY' | 'SELL'): Promise<number | null> {
+    try {
+      // Get last 48 M5 candles (~4 hours) to find structure
+      const m5Candles = await this.dataFeed.getRecentCandles(symbol, 'M5', 48);
+      if (!m5Candles || m5Candles.length < 10) return null;
+      
+      // For BUY: find the recent swing HIGH (our TP target)
+      // For SELL: find the recent swing LOW (our TP target)
+      
+      if (side === 'BUY') {
+        // Find swing high - look for a high that's higher than surrounding candles
+        // Start from recent candles and work backward to find a valid swing high
+        let bestSwingHigh = 0;
+        
+        for (let i = m5Candles.length - 3; i >= 2; i--) {
+          const candle = m5Candles[i];
+          const prevCandle = m5Candles[i - 1];
+          const prevPrevCandle = m5Candles[i - 2];
+          const nextCandle = m5Candles[i + 1];
+          const nextNextCandle = m5Candles[i + 2];
+          
+          // Swing high: current high is higher than 2 candles before and after
+          if (candle.high > prevCandle.high && 
+              candle.high > prevPrevCandle.high &&
+              candle.high > nextCandle.high &&
+              candle.high > nextNextCandle.high) {
+            if (candle.high > bestSwingHigh) {
+              bestSwingHigh = candle.high;
+            }
+          }
+        }
+        
+        // Fallback: if no swing high found, use highest high in range
+        if (bestSwingHigh === 0) {
+          for (const candle of m5Candles) {
+            if (candle.high > bestSwingHigh) {
+              bestSwingHigh = candle.high;
+            }
+          }
+        }
+        
+        return bestSwingHigh > 0 ? bestSwingHigh : null;
+      } else {
+        // Find swing low - look for a low that's lower than surrounding candles
+        let bestSwingLow = Infinity;
+        
+        for (let i = m5Candles.length - 3; i >= 2; i--) {
+          const candle = m5Candles[i];
+          const prevCandle = m5Candles[i - 1];
+          const prevPrevCandle = m5Candles[i - 2];
+          const nextCandle = m5Candles[i + 1];
+          const nextNextCandle = m5Candles[i + 2];
+          
+          // Swing low: current low is lower than 2 candles before and after
+          if (candle.low < prevCandle.low && 
+              candle.low < prevPrevCandle.low &&
+              candle.low < nextCandle.low &&
+              candle.low < nextNextCandle.low) {
+            if (candle.low < bestSwingLow) {
+              bestSwingLow = candle.low;
+            }
+          }
+        }
+        
+        // Fallback: if no swing low found, use lowest low in range
+        if (bestSwingLow === Infinity) {
+          for (const candle of m5Candles) {
+            if (candle.low < bestSwingLow) {
+              bestSwingLow = candle.low;
+            }
+          }
+        }
+        
+        return bestSwingLow < Infinity ? bestSwingLow : null;
+      }
+    } catch (err) {
+      warn('M5', `${symbol} failed to get M5 structure TP: ${err}`);
+      return null;
+    }
   }
 
   /**
@@ -2339,6 +2817,27 @@ export class SweepFVGStrategy {
       return;
     }
     
+    // Check for conflicting correlated pair trades
+    const correlationConflict = this.checkCorrelationConflict(symbol, side);
+    if (correlationConflict) {
+      warn('ENTRY', `${symbol} ${side} blocked - correlation conflict with ${correlationConflict.symbol} ${correlationConflict.side}`);
+      this.pendingSetups.delete(symbol);
+      return;
+    }
+    
+    // Check multi-timeframe trend confirmation (M15 or H1 must agree)
+    const mtfCheck = await this.checkMTFTrendAlignment(symbol, side);
+    if (!mtfCheck.aligned) {
+      warn('ENTRY', `${symbol} ${side} blocked - MTF trend not aligned`, {
+        m15Trend: mtfCheck.m15Trend,
+        h1Trend: mtfCheck.h1Trend,
+        required: side
+      });
+      this.pendingSetups.delete(symbol);
+      return;
+    }
+    info('ENTRY', `${symbol} ${side} MTF confirmed`, { m15: mtfCheck.m15Trend, h1: mtfCheck.h1Trend });
+    
     // Also check for existing pending orders ON MT5
     const pendingOrders = await this.connector.getPendingOrders(symbol);
     if (pendingOrders && pendingOrders.length > 0) {
@@ -2429,9 +2928,10 @@ export class SweepFVGStrategy {
       warn('ENTRY', `${symbol} could not get account info - using fallback balance`);
     }
     
-    // Calculate volume - pass current price for proper pip value calculation on JPY/USD base pairs
+    // Calculate volume - read risk from config file per symbol category (FX/XAU/Indices)
     const slPips = Math.abs(entryPrice - sl) / pipSize;
-    const volume = computeVolume(balance, this.config.riskPercent, slPips, symbol, currentPrice);
+    const riskPercent = getRiskForSymbol(symbol);
+    const volume = computeVolume(balance, riskPercent, slPips, symbol, currentPrice);
     
     info('ENTRY', `Placing ${orderType} for ${symbol}`, {
       entry: entryPrice.toFixed(isXAU ? 2 : 5),
@@ -2442,7 +2942,7 @@ export class SweepFVGStrategy {
       slPips: slPips.toFixed(1),
       orderType,
       balance: balance.toFixed(2),
-      riskPercent: this.config.riskPercent
+      riskPercent
     });
     
     try {
@@ -2634,6 +3134,147 @@ export class SweepFVGStrategy {
   private markTradeClosed(symbol: string): void {
     this.recentlyClosedTrades.set(symbol, Date.now());
     info('COOLDOWN', `${symbol} trade closed - cooldown for ${this.COOLDOWN_MINUTES} mins`, {});
+  }
+  
+  /**
+   * Check if a new trade would conflict with existing open trades on correlated pairs
+   * Returns the conflicting trade info if blocked, null if OK to proceed
+   */
+  private checkCorrelationConflict(symbol: string, side: 'BUY' | 'SELL'): { symbol: string; side: 'BUY' | 'SELL' } | null {
+    // Normalize symbol (remove suffix like 'z')
+    const baseSymbol = symbol.replace(/z$/i, '').toUpperCase();
+    
+    // Check against all open trades
+    for (const [openSymbol, trade] of this.openTrades) {
+      const openBaseSymbol = openSymbol.replace(/z$/i, '').toUpperCase();
+      
+      // Find correlation rule
+      for (const rule of CORRELATION_PAIRS) {
+        const isMatch = 
+          (rule.pairA === baseSymbol && rule.pairB === openBaseSymbol) ||
+          (rule.pairB === baseSymbol && rule.pairA === openBaseSymbol);
+        
+        if (isMatch) {
+          // Check for conflict based on correlation type
+          if (rule.inverse) {
+            // Inverse correlation: same direction = conflict
+            // e.g., BUY EURUSD + BUY USDCHF = bad (they move opposite)
+            if (side === trade.side) {
+              return { symbol: openSymbol, side: trade.side };
+            }
+          } else {
+            // Positive correlation: opposite direction = conflict
+            // e.g., BUY EURUSD + SELL GBPUSD = bad (they move together)
+            if (side !== trade.side) {
+              return { symbol: openSymbol, side: trade.side };
+            }
+          }
+        }
+      }
+    }
+    
+    return null;  // No conflict
+  }
+  
+  /**
+   * Check if 4H timeframe agrees with the entry direction using EMA 5/10 crossover
+   * Simple logic: EMA 5 > EMA 10 = bullish (BUY), EMA 5 < EMA 10 = bearish (SELL)
+   */
+  private async checkMTFTrendAlignment(
+    symbol: string, 
+    side: 'BUY' | 'SELL'
+  ): Promise<{ aligned: boolean; m15Trend: string; h1Trend: string }> {
+    // Get H4 trend using EMA 5/10 crossover
+    let h4Trend: 'BUY' | 'SELL' | 'NEUTRAL' = 'NEUTRAL';
+    try {
+      const h4Candles = await this.dataFeed.getRecentCandles(symbol, 'H4', 20);
+      if (h4Candles && h4Candles.length >= 10) {
+        const ema5 = this.calculateEMA(h4Candles, 5);
+        const ema10 = this.calculateEMA(h4Candles, 10);
+        
+        if (ema5 && ema10) {
+          // Simple crossover: EMA 5 > EMA 10 = bullish, EMA 5 < EMA 10 = bearish
+          if (ema5 > ema10) {
+            h4Trend = 'BUY';
+          } else if (ema5 < ema10) {
+            h4Trend = 'SELL';
+          }
+        }
+      }
+    } catch (err) {
+      warn('H4_TREND', `${symbol} failed to get H4 candles for alignment check: ${err}`);
+    }
+    
+    // H4 trend must match entry direction
+    const aligned = h4Trend === side;
+    
+    return {
+      aligned,
+      m15Trend: h4Trend,  // Using H4 value for logging compatibility
+      h1Trend: h4Trend    // Using H4 value for logging compatibility
+    };
+  }
+  
+  /**
+   * Determine which trade directions are allowed based on 4H EMA 5/10 crossover
+   * SIMPLE LOGIC: 
+   * - EMA 5 > EMA 10 = Bullish → Only BUYS allowed
+   * - EMA 5 < EMA 10 = Bearish → Only SELLS allowed
+   * This is used EARLY in the scanning process to filter what setups to look for
+   */
+  private async getAllowedDirections(symbol: string): Promise<{ 
+    allowBuy: boolean; 
+    allowSell: boolean; 
+    m15Trend: string;  // Kept for logging compatibility, now shows H4 trend
+    h1Trend: string    // Kept for logging compatibility, now shows H4 trend
+  }> {
+    // Get H4 trend using EMA 5/10 crossover
+    let h4Trend: 'BUY' | 'SELL' | 'NEUTRAL' = 'NEUTRAL';
+    try {
+      const h4Candles = await this.dataFeed.getRecentCandles(symbol, 'H4', 20);
+      if (h4Candles && h4Candles.length >= 10) {
+        const ema5 = this.calculateEMA(h4Candles, 5);
+        const ema10 = this.calculateEMA(h4Candles, 10);
+        
+        if (ema5 && ema10) {
+          // Simple crossover: EMA 5 > EMA 10 = bullish, EMA 5 < EMA 10 = bearish
+          if (ema5 > ema10) {
+            h4Trend = 'BUY';
+          } else if (ema5 < ema10) {
+            h4Trend = 'SELL';
+          }
+          
+          info('H4_TREND', `${symbol} H4 EMA 5/10 trend: ${h4Trend}`, {
+            ema5: ema5.toFixed(5),
+            ema10: ema10.toFixed(5)
+          });
+        }
+      }
+    } catch (err) {
+      warn('H4_TREND', `${symbol} failed to get H4 candles: ${err}`);
+    }
+    
+    // Determine allowed directions based on H4 trend
+    // STRICT: Only trade in direction of 4H EMA crossover
+    let allowBuy = false;
+    let allowSell = false;
+    
+    if (h4Trend === 'BUY') {
+      // H4 bullish - only look for buys
+      allowBuy = true;
+      allowSell = false;
+    } else if (h4Trend === 'SELL') {
+      // H4 bearish - only look for sells
+      allowBuy = false;
+      allowSell = true;
+    } else {
+      // H4 neutral (EMAs equal or very close) - allow both but this is rare
+      allowBuy = true;
+      allowSell = true;
+    }
+    
+    // Return with m15Trend and h1Trend set to h4Trend for logging compatibility
+    return { allowBuy, allowSell, m15Trend: h4Trend, h1Trend: h4Trend };
   }
   
   /**

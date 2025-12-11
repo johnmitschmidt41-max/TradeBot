@@ -236,52 +236,61 @@ def health():
 
 @app.route('/candles', methods=['POST'])
 def candles():
-    if not mt5_initialized:
-        return jsonify({"error": "MT5 not connected"}), 500
+    try:
+        if not mt5_initialized:
+            return jsonify({"error": "MT5 not connected"}), 500
 
-    data = request.json
-    symbol = data.get("symbol")
-    timeframe = data.get("timeframe", "M15")
-    count = data.get("count", 200)
+        data = request.json
+        if not data:
+            return jsonify({"error": "No JSON body provided"}), 400
+            
+        symbol = data.get("symbol")
+        timeframe = data.get("timeframe", "M15")
+        count = data.get("count", 200)
 
-    print(f"Candle request: {symbol} | {timeframe} | {count} bars")
+        print(f"Candle request: {symbol} | {timeframe} | {count} bars")
 
-    tf_map = {
-        "M1": mt5.TIMEFRAME_M1,
-        "M5": mt5.TIMEFRAME_M5,
-        "M15": mt5.TIMEFRAME_M15,
-        "M30": mt5.TIMEFRAME_M30,
-        "H1": mt5.TIMEFRAME_H1,
-        "H4": mt5.TIMEFRAME_H4,
-        "D1": mt5.TIMEFRAME_D1,
-    }
+        tf_map = {
+            "M1": mt5.TIMEFRAME_M1,
+            "M5": mt5.TIMEFRAME_M5,
+            "M15": mt5.TIMEFRAME_M15,
+            "M30": mt5.TIMEFRAME_M30,
+            "H1": mt5.TIMEFRAME_H1,
+            "H4": mt5.TIMEFRAME_H4,
+            "D1": mt5.TIMEFRAME_D1,
+        }
 
-    tf = tf_map.get(timeframe, mt5.TIMEFRAME_M15)
+        tf = tf_map.get(timeframe, mt5.TIMEFRAME_M15)
 
-    rates = mt5.copy_rates_from_pos(symbol, tf, 0, count)
+        rates = mt5.copy_rates_from_pos(symbol, tf, 0, count)
 
-    if rates is None:
-        error = mt5.last_error()
-        print(f"Failed to fetch {symbol}: {error}")
-        return jsonify({
-            "error": f"Failed to fetch candles for {symbol}",
-            "mt5_error": error
-        }), 500
+        if rates is None or len(rates) == 0:
+            error = mt5.last_error()
+            print(f"Failed to fetch {symbol}: {error}")
+            return jsonify({
+                "error": f"Failed to fetch candles for {symbol}",
+                "mt5_error": str(error)
+            }), 500
 
-    print(f"Fetched {len(rates)} candles for {symbol}")
+        print(f"Fetched {len(rates)} candles for {symbol}")
 
-    candles = []
-    for r in rates:
-        candles.append({
-            "time": int(r['time']),
-            "open": float(r['open']),
-            "high": float(r['high']),
-            "low": float(r['low']),
-            "close": float(r['close']),
-            "volume": int(r['tick_volume'])
-        })
+        candles_list = []
+        for r in rates:
+            candles_list.append({
+                "time": int(r['time']),
+                "open": float(r['open']),
+                "high": float(r['high']),
+                "low": float(r['low']),
+                "close": float(r['close']),
+                "volume": int(r['tick_volume'])
+            })
 
-    return jsonify({"candles": candles})
+        return jsonify({"candles": candles_list})
+    except Exception as e:
+        print(f"Error in /candles: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route('/positions', methods=['GET'])
@@ -338,12 +347,12 @@ def get_orders():
         if orders is None:
             # Check if there was an actual error or just no orders
             last_error = mt5.last_error()
-            if last_error[0] != mt5.RES_S_OK:
+            # last_error is a tuple like (1, "Success") or error code
+            if last_error and last_error[0] != 1:
                 print(f"Error fetching orders: {last_error}")
                 return jsonify({"error": f"MT5 Error: {last_error}", "orders": []}), 500
             
             # No orders found is not an error
-            # print(f"No orders returned for {symbol if symbol else 'all symbols'}")
             return jsonify({"orders": []})
         
         # Map MT5 order types to descriptions

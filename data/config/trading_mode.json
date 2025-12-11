@@ -3,5 +3,8 @@
   "lastSwitchTime": "2025-12-07T20:33:33.593Z",
   "consecutiveLosses": 0,
   "autoSwitchLocked": false,
-  "lockExpiresAt": null
+  "lockExpiresAt": null,
+  "riskFX": 3,
+  "riskXAU": 3,
+  "riskIndices": 3
 }

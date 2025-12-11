@@ -18,8 +18,8 @@ async function run() {
   }
 
   // New SweepFVG Strategy
+  // Risk is now read from config file per symbol category (FX/XAU/Indices)
   const strategy = new SweepFVGStrategy(connector, {
-    riskPercent: 5.0,
     maxTradesPerDay: 12,
     maxTradesPerSymbol: 4
   });
