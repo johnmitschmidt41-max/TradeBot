@@ -61,18 +61,23 @@ const SERVER_URL = '';
 
 const statusColors: Record<string, string> = {
   scanning: 'bg-gray-700/30 text-gray-400 border-gray-600/50',
-  sweep_detected: 'bg-amber-900/20 text-amber-400/80 border-amber-700/40',
-  fvg_formed: 'bg-purple-900/20 text-purple-400/80 border-purple-700/40',
-  waiting_entry: 'bg-orange-900/20 text-orange-400/80 border-orange-700/40',
-  ready: 'bg-orange-900/20 text-orange-400/80 border-orange-700/40',
-  continuation: 'bg-cyan-900/20 text-cyan-400/80 border-cyan-700/40',
-  trend_entry: 'bg-indigo-900/20 text-indigo-400/80 border-indigo-700/40',
-  pattern_entry: 'bg-pink-900/20 text-pink-400/80 border-pink-700/40',
-  pending_order: 'bg-lime-900/20 text-lime-400/80 border-lime-700/40',
-  triggered: 'bg-emerald-900/20 text-emerald-400/80 border-emerald-700/40',
+  sweep_detected: 'bg-amber-900/20 text-amber-400/80 border-amber-700/40 shadow-[0_0_15px_rgba(245,158,11,0.2)]',
+  fvg_formed: 'bg-purple-900/20 text-purple-400/80 border-purple-700/40 shadow-[0_0_15px_rgba(168,85,247,0.25)]',
+  waiting_entry: 'bg-orange-900/20 text-orange-400/80 border-orange-700/40 shadow-[0_0_18px_rgba(249,115,22,0.3)] animate-pulse',
+  ready: 'bg-orange-900/20 text-orange-400/80 border-orange-700/40 shadow-[0_0_20px_rgba(249,115,22,0.35)] animate-pulse',
+  continuation: 'bg-cyan-900/20 text-cyan-400/80 border-cyan-700/40 shadow-[0_0_15px_rgba(34,211,238,0.25)]',
+  trend_entry: 'bg-indigo-900/20 text-indigo-400/80 border-indigo-700/40 shadow-[0_0_15px_rgba(129,140,248,0.25)]',
+  pattern_entry: 'bg-pink-900/20 text-pink-400/80 border-pink-700/40 shadow-[0_0_15px_rgba(244,114,182,0.25)]',
+  pending_order: 'bg-lime-900/20 text-lime-400/80 border-lime-700/40 shadow-[0_0_20px_rgba(163,230,53,0.3)]',
+  triggered: 'bg-emerald-900/20 text-emerald-400/80 border-emerald-700/40 shadow-[0_0_25px_rgba(52,211,153,0.4)] animate-pulse',
   expired: 'bg-gray-800/30 text-gray-500 border-gray-700/40',
   skipped: 'bg-red-900/20 text-red-400/70 border-red-800/40',
   invalidated: 'bg-red-900/20 text-red-400/70 border-red-800/40',
+  // New: Order Block and Breaker statuses with glow
+  waiting_ob: 'bg-violet-900/20 text-violet-400/80 border-violet-700/40 shadow-[0_0_15px_rgba(139,92,246,0.25)]',
+  waiting_breaker_retest: 'bg-teal-900/20 text-teal-400/80 border-teal-700/40 shadow-[0_0_15px_rgba(45,212,191,0.25)]',
+  order_block: 'bg-violet-900/20 text-violet-400/80 border-violet-700/40 shadow-[0_0_15px_rgba(139,92,246,0.25)]',
+  breaker: 'bg-teal-900/20 text-teal-400/80 border-teal-700/40 shadow-[0_0_15px_rgba(45,212,191,0.25)]',
 };
 
 const statusLabels: Record<string, string> = {
@@ -89,9 +94,52 @@ const statusLabels: Record<string, string> = {
   expired: 'Expired',
   skipped: 'Skip',
   invalidated: 'Invalid',
+  // New: Order Block and Breaker labels
+  waiting_ob: 'OB Wait',
+  waiting_breaker_retest: 'Breaker',
+  order_block: 'Order Block',
+  breaker: 'Breaker',
 };
 
 function SetupCard({ symbol, setup, openTrade, isDisabled }: { symbol: string; setup: Setup | null; openTrade?: OpenTrade | null; isDisabled?: boolean }) {
+  // Countdown timer state for pending orders (2 hour expiry = 120 minutes)
+  const [countdown, setCountdown] = useState<string>('');
+  
+  useEffect(() => {
+    if (!setup?.pendingOrderPlacedAt) {
+      setCountdown('');
+      return;
+    }
+    
+    const updateCountdown = () => {
+      const placedAt = new Date(setup.pendingOrderPlacedAt!).getTime();
+      const expiryTime = placedAt + (120 * 60 * 1000); // 2 hours in ms
+      const remaining = expiryTime - Date.now();
+      
+      if (remaining <= 0) {
+        setCountdown('Expired');
+        return;
+      }
+      
+      const totalMinutes = Math.floor(remaining / 60000);
+      const hours = Math.floor(totalMinutes / 60);
+      const minutes = totalMinutes % 60;
+      const seconds = Math.floor((remaining % 60000) / 1000);
+      
+      if (hours > 0) {
+        setCountdown(`${hours}h ${minutes}m`);
+      } else if (minutes > 0) {
+        setCountdown(`${minutes}m ${seconds}s`);
+      } else {
+        setCountdown(`${seconds}s`);
+      }
+    };
+    
+    updateCountdown();
+    const interval = setInterval(updateCountdown, 1000);
+    return () => clearInterval(interval);
+  }, [setup?.pendingOrderPlacedAt]);
+  
   // If symbol is disabled, show disabled overlay
   if (isDisabled) {
     return (
@@ -116,25 +164,31 @@ function SetupCard({ symbol, setup, openTrade, isDisabled }: { symbol: string; s
   // If there's an open trade (must have ticket to be valid), show that instead
   if (openTrade && openTrade.ticket) {
     const pnlColor = (openTrade.unrealizedPips || 0) >= 0 ? 'text-emerald-400' : 'text-red-400';
+    const glowColor = (openTrade.unrealizedPips || 0) >= 0 
+      ? 'shadow-[0_0_25px_rgba(52,211,153,0.4)]' 
+      : 'shadow-[0_0_20px_rgba(248,113,113,0.3)]';
+    const borderColor = (openTrade.unrealizedPips || 0) >= 0 
+      ? 'border-emerald-500/50' 
+      : 'border-red-500/40';
     return (
-      <div className={`bg-gray-800/30 rounded-lg p-2 border min-h-[120px] border-gray-600/40`}>
+      <div className={`bg-gray-800/30 rounded-lg p-2 border min-h-[120px] ${borderColor} ${glowColor} transition-all duration-500`}>
         {/* Header */}
         <div className="flex items-center justify-between mb-2">
           <div className="flex items-center gap-2">
             <h3 className="text-lg font-bold text-gray-200">{symbol.replace('z', '')}</h3>
-            <span className={`px-1.5 py-0.5 text-xs font-bold rounded ${openTrade.side === 'BUY' ? 'bg-gray-600/50 text-gray-300' : 'bg-gray-600/50 text-gray-300'}`}>
+            <span className={`px-1.5 py-0.5 text-xs font-bold rounded ${openTrade.side === 'BUY' ? 'bg-cyan-600/30 text-cyan-300 border border-cyan-500/30' : 'bg-pink-600/30 text-pink-300 border border-pink-500/30'}`}>
               {openTrade.side}
             </span>
           </div>
-          <span className="px-2 py-1 text-xs rounded bg-gray-700/50 text-gray-400 border border-gray-600/50">
+          <span className="px-2 py-1 text-xs rounded bg-emerald-700/30 text-emerald-400 border border-emerald-500/40 animate-pulse">
             ● LIVE
           </span>
         </div>
         
         {/* Live P/L */}
-        <div className="bg-black/20 rounded p-3 mb-2">
+        <div className="bg-black/30 rounded p-3 mb-2 backdrop-blur-sm">
           <div className="flex justify-between items-center mb-2">
-            <span className="text-gray-600 text-sm">Unrealized P/L</span>
+            <span className="text-gray-500 text-sm">Unrealized P/L</span>
             <span className={`text-xl font-bold ${pnlColor}`}>
               {(openTrade.unrealizedPips || 0) >= 0 ? '+' : ''}{(openTrade.unrealizedPips || 0).toFixed(1)} pips
             </span>
@@ -183,15 +237,23 @@ function SetupCard({ symbol, setup, openTrade, isDisabled }: { symbol: string; s
   const statusLabel = statusLabels[setup.status] || setup.status;
   const isSweepMode = setup.tradingMode === 'sweep';
   const isTrendMode = setup.tradingMode === 'trend';
+  
+  // Determine card glow based on status and side
+  const isActiveSetup = ['waiting_entry', 'ready', 'pending_order', 'triggered', 'fvg_formed', 'waiting_ob', 'waiting_breaker_retest'].includes(setup.status);
+  const cardGlow = isActiveSetup 
+    ? setup.side === 'BUY' 
+      ? 'shadow-[0_0_20px_rgba(34,211,238,0.25)] border-cyan-500/40' 
+      : 'shadow-[0_0_20px_rgba(244,114,182,0.25)] border-pink-500/40'
+    : 'border-gray-600/40';
 
   return (
-    <div className={`bg-gray-800/30 rounded-lg p-2 border backdrop-blur-md min-h-[120px] border-gray-600/40`}>
+    <div className={`bg-gray-800/30 rounded-lg p-2 border backdrop-blur-md min-h-[120px] ${cardGlow} transition-all duration-300`}>
       {/* Header */}
       <div className="flex items-center justify-between mb-3">
         <div className="flex items-center gap-2">
           <h3 className="text-lg font-bold text-gray-200">{symbol.replace('z', '')}</h3>
           {setup.side && (
-            <span className={`px-1.5 py-0.5 text-xs font-bold rounded bg-gray-600/50 text-gray-300`}>
+            <span className={`px-1.5 py-0.5 text-xs font-bold rounded ${setup.side === 'BUY' ? 'bg-cyan-600/30 text-cyan-300 border border-cyan-500/30' : 'bg-pink-600/30 text-pink-300 border border-pink-500/30'}`}>
               {setup.side}
             </span>
           )}
@@ -290,8 +352,13 @@ function SetupCard({ symbol, setup, openTrade, isDisabled }: { symbol: string; s
               <span className="text-gray-400">#{setup.pendingOrderTicket}</span>
             </div>
             {setup.pendingOrderPlacedAt && (
-              <div className="text-xs text-gray-500 mt-1">
-                Placed: {new Date(setup.pendingOrderPlacedAt).toLocaleTimeString()}
+              <div className="flex justify-between items-center text-xs mt-1">
+                <span className="text-gray-500">Placed: {new Date(setup.pendingOrderPlacedAt).toLocaleTimeString()}</span>
+                {countdown && (
+                  <span className={`font-mono ${countdown === 'Expired' ? 'text-red-400' : 'text-lime-400'}`}>
+                    ⏱ {countdown}
+                  </span>
+                )}
               </div>
             )}
             <div className="text-xs text-gray-600 mt-1">
@@ -347,8 +414,8 @@ function SetupCard({ symbol, setup, openTrade, isDisabled }: { symbol: string; s
 // All symbols the bot tracks (including disabled ones for display)
 const ALL_SYMBOLS = ['GBPUSDz', 'EURUSDz', 'XAUUSDz', 'USDJPYz', 'AUDUSDz', 'NZDUSDz', 'USDCADz', 'EURJPYz', 'US30z', 'NAS100z'];
 
-// Symbols temporarily disabled (XAU and indices until January)
-const DISABLED_SYMBOLS = ['XAUUSDz', 'US30z', 'NAS100z'];
+// Symbols temporarily disabled (indices until configured)
+const DISABLED_SYMBOLS = ['US30z', 'NAS100z'];
 
 // RiskInput Component - MUST be defined outside RiskControl to prevent recreation on every render
 function RiskInput({ 
@@ -503,7 +570,7 @@ function RiskControl() {
       </div>
       <div className="space-y-2">
         <RiskInput label="FX" value={riskFX} category="riskFX" loading={loading} onUpdate={updateRisk} />
-        <RiskInput label="Gold" value={riskXAU} category="riskXAU" disabled loading={loading} onUpdate={updateRisk} />
+        <RiskInput label="Gold" value={riskXAU} category="riskXAU" disabled={false} loading={loading} onUpdate={updateRisk} />
         <RiskInput label="Indices" value={riskIndices} category="riskIndices" disabled loading={loading} onUpdate={updateRisk} />
       </div>
       <div className="mt-2 text-xs text-gray-500">
@@ -530,8 +597,19 @@ export default function SetupVisualization() {
   // Debounce ref to prevent rapid state updates causing flicker
   const pendingSetupsRef = useRef<LiveSetups | null>(null);
   const debounceTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const lastSetupsJsonRef = useRef<string>('');
   
-  // Debounced setups update to prevent flicker
+  // Deep compare helper - only update if data actually changed
+  const hasSetupsChanged = (newSetups: LiveSetups): boolean => {
+    const newJson = JSON.stringify(newSetups);
+    if (newJson === lastSetupsJsonRef.current) {
+      return false; // No change
+    }
+    lastSetupsJsonRef.current = newJson;
+    return true;
+  };
+  
+  // Debounced setups update to prevent flicker - ONLY updates if data changed
   const updateSetupsDebounced = (newSetups: LiveSetups) => {
     pendingSetupsRef.current = newSetups;
     
@@ -540,13 +618,13 @@ export default function SetupVisualization() {
       clearTimeout(debounceTimerRef.current);
     }
     
-    // Set new timer - update after 100ms of no new updates
+    // Set new timer - update after 150ms of no new updates (increased from 100ms)
     debounceTimerRef.current = setTimeout(() => {
-      if (pendingSetupsRef.current) {
+      if (pendingSetupsRef.current && hasSetupsChanged(pendingSetupsRef.current)) {
         setSetups(pendingSetupsRef.current);
-        pendingSetupsRef.current = null;
       }
-    }, 100);
+      pendingSetupsRef.current = null;
+    }, 150);
   };
 
   // Fetch setups (backup polling ONLY when SSE is disconnected)
@@ -555,14 +633,15 @@ export default function SetupVisualization() {
       const response = await fetch('/api/setups');
       const data = await response.json();
       if (data.setups) {
-        // Use immediate update for polling (only runs when disconnected)
-        setSetups(prev => {
-          const merged: LiveSetups = {};
-          ALL_SYMBOLS.forEach(symbol => {
-            merged[symbol] = data.setups[symbol] ?? prev[symbol] ?? null;
-          });
-          return merged;
+        // Merge incoming setups
+        const merged: LiveSetups = {};
+        ALL_SYMBOLS.forEach(symbol => {
+          merged[symbol] = data.setups[symbol] ?? null;
         });
+        // Only update if data actually changed
+        if (hasSetupsChanged(merged)) {
+          setSetups(merged);
+        }
       }
     } catch (e) {
       console.error('Failed to fetch setups:', e);
@@ -670,7 +749,7 @@ export default function SetupVisualization() {
       };
 
       eventSource.onmessage = (event) => {
-        console.log('SetupVisualization: Received message', event.data);
+        // Removed noisy console.log - data updates too frequently
         if (isMounted) {
           setConnected(true);
           try {

@@ -1,13 +1,8 @@
-import { useEffect, useRef, useState, ReactNode } from 'react';
+import { useEffect, useRef, useState, ReactNode, useCallback } from 'react';
 import SetupVisualization from './components/SetupVisualization';
 import TradeJournal from './components/TradeJournal';
 import ControlPanel from './components/ControlPanel';
-
-interface LogBoxProps {
-  title: string;
-  color: string;
-  fullWidth?: boolean;
-}
+import { ToastProvider, useToast, ToastType } from './components/Toast';
 
 interface LogEntry {
   timestamp?: string;
@@ -204,12 +199,84 @@ const LogEntry = ({ entry }: { entry: LogEntry }) => {
   );
 };
 
-const LogBox = ({ title, color, fullWidth = false }: LogBoxProps) => {
+// Helper to detect trade events from log entries
+const detectTradeEvent = (entry: LogEntry): { type: ToastType; title: string; message: string; symbol?: string; pips?: number } | null => {
+  const level = entry.level?.toUpperCase();
+  const message = entry.message || '';
+  const data = entry.data || {};
+  
+  // TRADE log - trade opened or closed
+  if (level === 'TRADE') {
+    // Check if it's a market order opened
+    if (message.includes('MARKET order opened') || message.includes('opened')) {
+      const symbol = data.symbol || message.split(' ')[0] || 'Unknown';
+      const side = message.includes('BUY') ? 'BUY' : message.includes('SELL') ? 'SELL' : '';
+      return {
+        type: 'trade_open',
+        title: `${symbol} ${side} Trade Opened`,
+        message: `Entry: ${data.entry || data.price || 'N/A'}`,
+        symbol,
+      };
+    }
+    
+    // Trade closed with profit/loss
+    if (message.includes('closed') || message.includes('TP hit') || message.includes('SL hit')) {
+      const symbol = data.symbol || message.split(' ')[0] || 'Unknown';
+      const pips = data.pips || data.profit_pips;
+      const isWin = pips > 0 || message.includes('TP hit') || message.includes('profit');
+      return {
+        type: isWin ? 'trade_win' : 'trade_loss',
+        title: `${symbol} Trade ${isWin ? 'Won' : 'Lost'}`,
+        message: isWin ? `Take Profit hit! 🎉` : `Stop Loss hit`,
+        symbol,
+        pips: typeof pips === 'number' ? pips : undefined,
+      };
+    }
+  }
+  
+  // Pending order placed
+  if (level === 'ORDER' || message.includes('pending') || message.includes('limit')) {
+    if (message.includes('placed') || message.includes('Pending')) {
+      const symbol = data.symbol || message.split(' ')[0] || 'Unknown';
+      const side = message.includes('BUY') ? 'BUY' : message.includes('SELL') ? 'SELL' : '';
+      const price = data.entry || data.price || 'N/A';
+      return {
+        type: 'order_placed',
+        title: `${symbol} ${side} Limit Placed`,
+        message: `Entry: ${price}`,
+        symbol,
+      };
+    }
+  }
+  
+  // Entry executed from pending
+  if (message.includes('Entry executed') || message.includes('limit triggered')) {
+    const symbol = data.symbol || message.split(' ')[0] || 'Unknown';
+    return {
+      type: 'trade_open',
+      title: `${symbol} Limit Triggered`,
+      message: `Pending order filled`,
+      symbol,
+    };
+  }
+  
+  return null;
+};
+
+interface LogBoxProps {
+  title: string;
+  color: string;
+  fullWidth?: boolean;
+  onTradeEvent?: (event: { type: ToastType; title: string; message: string; symbol?: string; pips?: number }) => void;
+}
+
+const LogBox = ({ title, color, fullWidth = false, onTradeEvent }: LogBoxProps) => {
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [isConnected, setIsConnected] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
+  const [isFullscreen, setIsFullscreen] = useState(false);
   const maxLogs = 500;
-  const boxHeight = fullWidth ? 'h-[500px]' : 'h-[400px]';
+  const boxHeight = isFullscreen ? 'fixed inset-4 z-50 h-auto' : fullWidth ? 'h-[500px]' : 'h-[400px]';
   
   // Map title to service name for API calls
   const serviceName = title.toLowerCase().replace(/\s+/g, '-');
@@ -226,6 +293,15 @@ const LogBox = ({ title, color, fullWidth = false }: LogBoxProps) => {
       try {
         const parsed = parseLog(event.data);
         console.log('Parsed log:', parsed);
+        
+        // Check for trade events and trigger toast
+        if (onTradeEvent && serviceName === 'mainbot') {
+          const tradeEvent = detectTradeEvent(parsed);
+          if (tradeEvent) {
+            onTradeEvent(tradeEvent);
+          }
+        }
+        
         setLogs((prevLogs) => {
           const updated = [...prevLogs, parsed];
           return updated.length > maxLogs ? updated.slice(-maxLogs) : updated;
@@ -246,15 +322,36 @@ const LogBox = ({ title, color, fullWidth = false }: LogBoxProps) => {
     };
 
     return () => eventSource.close();
-  }, [serviceName]);
+  }, [serviceName, onTradeEvent]);
 
-  // Auto-scroll only within the log container, not the page
+  // Smart auto-scroll: only scroll if user is already at the bottom
   const logContainerRef = useRef<HTMLDivElement>(null);
-  useEffect(() => {
+  const [isAutoScroll, setIsAutoScroll] = useState(true);  // Track if auto-scroll is active
+  
+  // Update isAutoScroll when user scrolls
+  const handleScroll = () => {
+    if (logContainerRef.current) {
+      const { scrollTop, scrollHeight, clientHeight } = logContainerRef.current;
+      // Consider "at bottom" if within 50px of bottom
+      const atBottom = scrollHeight - scrollTop - clientHeight < 50;
+      setIsAutoScroll(atBottom);
+    }
+  };
+  
+  // Scroll to bottom (for manual resume)
+  const scrollToBottom = () => {
     if (logContainerRef.current) {
       logContainerRef.current.scrollTop = logContainerRef.current.scrollHeight;
+      setIsAutoScroll(true);
     }
-  }, [logs]);
+  };
+  
+  useEffect(() => {
+    // Only auto-scroll if user was already at the bottom
+    if (logContainerRef.current && isAutoScroll) {
+      logContainerRef.current.scrollTop = logContainerRef.current.scrollHeight;
+    }
+  }, [logs, isAutoScroll]);
 
   // Service control functions
   const handleStart = async () => {
@@ -297,10 +394,29 @@ const LogBox = ({ title, color, fullWidth = false }: LogBoxProps) => {
     setLogs([]);
   };
 
+  // Handle escape key to exit fullscreen
+  useEffect(() => {
+    const handleEscape = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && isFullscreen) {
+        setIsFullscreen(false);
+      }
+    };
+    window.addEventListener('keydown', handleEscape);
+    return () => window.removeEventListener('keydown', handleEscape);
+  }, [isFullscreen]);
+
   const statusColor = isConnected ? 'bg-emerald-500' : 'bg-red-500';
 
   return (
-    <div className={`flex flex-col bg-gray-900/60 backdrop-blur-sm rounded-lg border border-gray-700/50 overflow-hidden ${boxHeight}`}>
+    <>
+      {/* Fullscreen backdrop - more transparent/reflective */}
+      {isFullscreen && (
+        <div 
+          className="fixed inset-0 bg-black/40 backdrop-blur-sm z-40" 
+          onClick={() => setIsFullscreen(false)}
+        />
+      )}
+      <div className={`flex flex-col bg-gray-900/60 backdrop-blur-sm rounded-lg border border-gray-700/50 overflow-hidden ${boxHeight}`}>
       {/* Header */}
       <div className="bg-gray-800/50 px-4 py-2 border-b border-gray-700/50 flex items-center justify-between">
         <div className="flex items-center gap-2">
@@ -341,11 +457,22 @@ const LogBox = ({ title, color, fullWidth = false }: LogBoxProps) => {
           >
             Clear
           </button>
+          <button
+            onClick={() => setIsFullscreen(!isFullscreen)}
+            className={`px-2 py-1 text-xs rounded transition-colors ${
+              isFullscreen 
+                ? 'bg-blue-600/80 hover:bg-blue-600 text-white' 
+                : 'bg-gray-700/80 hover:bg-gray-600 text-gray-300'
+            }`}
+            title={isFullscreen ? 'Exit Fullscreen' : 'Fullscreen'}
+          >
+            {isFullscreen ? '⊟' : '⊞'}
+          </button>
         </div>
       </div>
 
       {/* Log Container */}
-      <div ref={logContainerRef} className="flex-1 overflow-y-auto p-4 bg-black/40">
+      <div ref={logContainerRef} onScroll={handleScroll} className="flex-1 overflow-y-auto p-4 bg-black/40">
         {logs.length === 0 ? (
           <div className="text-gray-600 text-center py-8">
             {isConnected ? 'Waiting for logs...' : 'Connecting...'}
@@ -379,16 +506,34 @@ const LogBox = ({ title, color, fullWidth = false }: LogBoxProps) => {
       </div>
 
       {/* Footer */}
-      <div className="bg-gray-800/50 px-4 py-2 border-t border-gray-700/50 text-xs text-gray-500">
-        {logs.length} logs • Auto-scroll enabled
+      <div className="bg-gray-800/50 px-4 py-2 border-t border-gray-700/50 text-xs text-gray-500 flex items-center justify-between">
+        <span>{logs.length} logs</span>
+        {isAutoScroll ? (
+          <span className="text-emerald-500">● Auto-scroll</span>
+        ) : (
+          <button 
+            onClick={scrollToBottom}
+            className="text-amber-400 hover:text-amber-300 flex items-center gap-1"
+          >
+            ● Paused - Click to resume ↓
+          </button>
+        )}
       </div>
     </div>
+    </>
   );
 };
 
-export default function App() {
+// Dashboard component that uses toast
+function Dashboard() {
   const [showJournal, setShowJournal] = useState(false);
   const [showControl, setShowControl] = useState(true);
+  const { addToast } = useToast();
+
+  // Handle trade events from log stream
+  const handleTradeEvent = useCallback((event: { type: ToastType; title: string; message: string; symbol?: string; pips?: number }) => {
+    addToast(event);
+  }, [addToast]);
 
   return (
     <div className="min-h-screen bg-black p-6">
@@ -451,6 +596,7 @@ export default function App() {
           title="MainBot"
           color="border-blue-500"
           fullWidth={true}
+          onTradeEvent={handleTradeEvent}
         />
       </div>
 
@@ -471,5 +617,14 @@ export default function App() {
         <p>SweepFVG Strategy | London + NY Sessions | MongoDB Trade Storage</p>
       </div>
     </div>
+  );
+}
+
+// Main App with Toast Provider
+export default function App() {
+  return (
+    <ToastProvider>
+      <Dashboard />
+    </ToastProvider>
   );
 }

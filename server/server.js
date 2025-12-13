@@ -307,6 +307,63 @@ app.get('/api/health', (req, res) => {
   });
 });
 
+// TEST endpoint - inject fake trade events for toast testing
+app.post('/api/test-toast', (req, res) => {
+  const { type } = req.body; // 'order', 'open', 'win', 'loss'
+  
+  const timestamp = new Date().toLocaleTimeString('en-US', { 
+    hour12: true, hour: '2-digit', minute: '2-digit', second: '2-digit' 
+  });
+  
+  let logEntry;
+  
+  switch (type) {
+    case 'order':
+      logEntry = {
+        timestamp,
+        level: 'ORDER',
+        message: 'EURUSDz BUY Pending limit placed',
+        data: { symbol: 'EURUSDz', side: 'BUY', entry: '1.04850', sl: '1.04650', tp: '1.05250' }
+      };
+      break;
+    case 'open':
+      logEntry = {
+        timestamp,
+        level: 'TRADE',
+        message: 'GBPUSDz SELL MARKET order opened',
+        data: { symbol: 'GBPUSDz', side: 'SELL', entry: '1.27450', ticket: 12345 }
+      };
+      break;
+    case 'win':
+      logEntry = {
+        timestamp,
+        level: 'TRADE',
+        message: 'EURUSDz trade closed TP hit',
+        data: { symbol: 'EURUSDz', pips: 35.5, profit: 177.50 }
+      };
+      break;
+    case 'loss':
+      logEntry = {
+        timestamp,
+        level: 'TRADE',
+        message: 'GBPUSDz trade closed SL hit',
+        data: { symbol: 'GBPUSDz', pips: -18, profit: -90.00 }
+      };
+      break;
+    default:
+      logEntry = {
+        timestamp,
+        level: 'INFO',
+        message: 'Test log message',
+        data: { test: true }
+      };
+  }
+  
+  console.log(`🧪 TEST: Injecting ${type || 'info'} event`);
+  broadcastLog('mainbot', logEntry);
+  res.json({ success: true, type, logEntry });
+});
+
 // Trading mode endpoint - returns current mode (DEMO/REAL)
 app.get('/api/mode', (req, res) => {
   try {
