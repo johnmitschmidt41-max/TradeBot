@@ -9,6 +9,9 @@ import { OrderManager } from "../core/order-manager";
 import { MT5Connector } from "../core/mt5-connector";
 import { detectFVG, FVG } from "../detectors/fvg-detector";
 import { detectReversalPattern, isMomentumFading, ReversalPattern } from "../detectors/double-top-bottom-detector";
+import { detectOrderBlock, findRelevantOB, OrderBlock } from "../detectors/ob-detector";
+import { BreakerZone, detectBreakerBlocks, checkBreakerRetest, sweepToBreaker, updateBreakerZones } from "../detectors/breaker-detector";
+import { ZoneManager, Zone, ZoneCluster, ReactionResult } from "../detectors/zone-manager";
 import { computeVolume } from "../core/position-sizing";
 import { getSessionManager, SessionManager, SessionName } from "../core/session-manager";
 import { info, warn } from "../utils/logger";
@@ -22,8 +25,8 @@ import { OrderDatabase, PendingOrderRecord } from "../core/order-db";
 // Path to trading config (risk, mode, etc.)
 const TRADING_CONFIG_PATH = path.join(__dirname, '..', '..', 'data', 'config', 'trading_mode.json');
 
-// Symbols disabled until January 2025 (XAU too volatile, indices not yet configured)
-const DISABLED_SYMBOLS = ['XAUUSDz', 'US30z', 'NAS100z'];
+// Symbols disabled until properly configured (indices not yet ready)
+const DISABLED_SYMBOLS = ['US30z', 'NAS100z'];
 
 // Helper to get risk percent for a specific symbol category
 function getRiskForSymbol(symbol: string): number {
@@ -186,6 +189,7 @@ const CORRELATION_PAIRS: { pairA: string; pairB: string; inverse: boolean }[] = 
   // Strongly correlated (move together) - don't take opposite directions
   { pairA: 'EURUSD', pairB: 'GBPUSD', inverse: false },   // Both move with USD weakness
   { pairA: 'AUDUSD', pairB: 'NZDUSD', inverse: false },   // Both commodity currencies
+  { pairA: 'USDJPY', pairB: 'EURJPY', inverse: false },   // Both XXX/JPY - JPY is base, they move together
   // Inversely correlated (move opposite) - don't take same direction  
   { pairA: 'EURUSD', pairB: 'USDCHF', inverse: true },    // Almost perfect inverse
   { pairA: 'EURUSD', pairB: 'USDCAD', inverse: true },    // USD on opposite sides
@@ -197,7 +201,7 @@ const CORRELATION_PAIRS: { pairA: string; pairB: string; inverse: boolean }[] = 
 
 const DEFAULT_CONFIG: StrategyConfig = {
   // All tradeable symbols - disabled ones are filtered by DISABLED_SYMBOLS constant
-  // XAUUSDz, US30z, NAS100z disabled for December 2024, re-enable in January
+  // US30z, NAS100z disabled until configured
   symbols: ['GBPUSDz', 'EURUSDz', 'USDJPYz', 'AUDUSDz', 'NZDUSDz', 'USDCADz', 'EURJPYz', 'XAUUSDz', 'US30z', 'NAS100z'],
   entryTimeframe: 'M5',
   riskPercent: 5.0,
@@ -237,7 +241,7 @@ const DEFAULT_CONFIG: StrategyConfig = {
 // TYPES
 // ═══════════════════════════════════════════════════════════════════
 
-type SetupType = 'reversal' | 'continuation' | 'trend' | 'double_top' | 'double_bottom' | 'triple_top' | 'triple_bottom';
+type SetupType = 'reversal' | 'continuation' | 'trend' | 'double_top' | 'double_bottom' | 'triple_top' | 'triple_bottom' | 'order_block' | 'breaker';
 
 interface PendingSetup {
   symbol: string;
@@ -246,13 +250,15 @@ interface PendingSetup {
   sweepTime: Date;
   sweepSession: SessionName;
   fvg: FVG | null;
-  reversalPattern?: ReversalPattern;  // Double/Triple Top/Bottom pattern
+  orderBlock?: OrderBlock;             // Order block entry (alternative to FVG)
+  breakerZone?: BreakerZone;           // Breaker block entry
+  reversalPattern?: ReversalPattern;   // Double/Triple Top/Bottom pattern
   candlesSinceSweep: number;
   lastCandleTime: number;      // Track candle time to only count new candles
   entryPrice: number | null;
   sl: number | null;
   tp: number | null;
-  status: 'waiting_fvg' | 'waiting_rejection' | 'waiting_entry' | 'ready' | 'continuation' | 'trend_entry' | 'pattern_entry' | 'invalidated' | 'pending_order';
+  status: 'waiting_fvg' | 'waiting_rejection' | 'waiting_entry' | 'ready' | 'pattern_entry' | 'waiting_ob' | 'waiting_breaker_retest' | 'invalidated' | 'pending_order' | 'waiting_continuation_retest' | 'waiting_trend_retest';
   setupType: SetupType;
   highestAfterSweep?: number;  // Track momentum after sweep
   lowestAfterSweep?: number;
@@ -335,6 +341,12 @@ export class SweepFVGStrategy {
   private recentlyUsedLevels: Map<string, { level: number; time: number; side: 'BUY' | 'SELL' }> = new Map();
   private readonly LEVEL_COOLDOWN_MINUTES = 60;  // Don't use same sweep level for 60 mins
   private readonly LEVELS_FILE = path.join(__dirname, '../../data/output/used_levels.json');
+  
+  // Track breaker zones per symbol (broken S/R levels waiting for retest)
+  private breakerZones: Map<string, BreakerZone[]> = new Map();
+  
+  // Zone Manager for continuous zone detection and reaction-based entry
+  private zoneManager: ZoneManager = new ZoneManager();
   
   // JSON database for persistent order tracking
   private orderDB: OrderDatabase;
@@ -482,12 +494,18 @@ export class SweepFVGStrategy {
         if (pending) {
           if (pending.status === 'waiting_fvg') {
             analysis.push(`${symbol} ${modeTag}: Sweep detected! Waiting for ${pending.side === 'BUY' ? 'bullish' : 'bearish'} FVG (${pending.candlesSinceSweep}/${this.config.fvg.maxAgeBars} bars)`);
-          } else if (pending.status === 'continuation' && pending.entryPrice) {
-            analysis.push(`${symbol} ${modeTag}: CONTINUATION ${pending.side}! Entry at ${pending.entryPrice.toFixed(5)}`);
-          } else if (pending.status === 'trend_entry' && pending.entryPrice) {
-            analysis.push(`${symbol} ${modeTag}: TREND ${pending.side}! Entry at ${pending.entryPrice.toFixed(5)}`);
+          } else if (pending.status === 'waiting_continuation_retest') {
+            analysis.push(`${symbol} ${modeTag}: CONTINUATION ${pending.side}! Waiting for FVG/OB retest (${pending.candlesSinceSweep}/12 bars)`);
+          } else if (pending.status === 'waiting_trend_retest') {
+            analysis.push(`${symbol} ${modeTag}: TREND ${pending.side}! Waiting for FVG/OB retest (${pending.candlesSinceSweep}/12 bars)`);
           } else if (pending.status === 'waiting_entry' && pending.entryPrice) {
             analysis.push(`${symbol} ${modeTag}: REVERSAL ${pending.side}! Entry at ${pending.entryPrice.toFixed(5)}`);
+          } else if (pending.status === 'waiting_rejection') {
+            analysis.push(`${symbol} ${modeTag}: FVG formed! Waiting for rejection candle`);
+          } else if (pending.status === 'waiting_ob') {
+            analysis.push(`${symbol} ${modeTag}: Waiting for Order Block retest`);
+          } else if (pending.status === 'pending_order' && pending.entryPrice) {
+            analysis.push(`${symbol} ${modeTag}: PENDING ORDER ${pending.side} at ${pending.entryPrice.toFixed(5)}`);
           }
         } else if (mode === 'trend') {
           const trendDir = trendState?.direction || 'calculating...';
@@ -905,7 +923,7 @@ export class SweepFVGStrategy {
             tp: position.tp || setup.tp || 0,
             volume: position.volume,
             ticket: position.ticket
-          });
+          }, setup);
           continue;
         }
         
@@ -983,12 +1001,12 @@ export class SweepFVGStrategy {
           }
         }
         
-        // Check if order has been pending too long (60 mins max - allow time for consolidation)
+        // Check if order has been pending too long (120 mins max - allow time for consolidation)
         const orderAge = setup.pendingOrderPlacedAt 
           ? (Date.now() - setup.pendingOrderPlacedAt.getTime()) / (1000 * 60)
           : 0;
         
-        if (orderAge > 60) {
+        if (orderAge > 120) {
           warn('PENDING_EXPIRED', `${symbol} pending order EXPIRED - ${orderAge.toFixed(0)} mins old`, {
             ticket: setup.pendingOrderTicket
           });
@@ -1317,7 +1335,7 @@ export class SweepFVGStrategy {
     }
     
     // Get candle data
-    const candles = await this.dataFeed.getRecentCandles(symbol, this.config.entryTimeframe, 50);
+    const candles = await this.dataFeed.getRecentCandles(symbol, this.config.entryTimeframe, 200);
     if (!candles || candles.length < 20) {
       return;
     }
@@ -1391,9 +1409,17 @@ export class SweepFVGStrategy {
       // Get allowed directions based on M15/H1 trend alignment
       const mtfDirections = await this.getAllowedDirections(symbol);
       
+      // First, check for breaker block retests (these have priority)
+      // Breakers are broken S/R levels waiting for retest
+      if (!this.pendingSetups.has(symbol)) {
+        await this.checkBreakerEntries(symbol, candles, currentPrice, mtfDirections);
+      }
+      
       if (mode === 'sweep') {
         // SWEEP MODE: Look for session level sweeps
-        await this.lookForSweep(symbol, candles, activeSessions, mtfDirections);
+        if (!this.pendingSetups.has(symbol)) {
+          await this.lookForSweep(symbol, candles, activeSessions, mtfDirections);
+        }
         
         // Also check for Double/Triple Top/Bottom patterns when momentum is fading
         if (!this.pendingSetups.has(symbol) && isMomentumFading(candles)) {
@@ -1401,7 +1427,24 @@ export class SweepFVGStrategy {
         }
       } else {
         // TREND MODE: Look for trend continuation entries
-        await this.lookForTrendEntry(symbol, candles, currentPrice, isXAU, pipSize, mtfDirections);
+        if (!this.pendingSetups.has(symbol)) {
+          await this.lookForTrendEntry(symbol, candles, currentPrice, isXAU, pipSize, mtfDirections);
+        }
+      }
+      
+      // Update breaker zones with new price data (detect new breaks)
+      const existingBreakers = this.breakerZones.get(symbol) || [];
+      const updatedBreakers = detectBreakerBlocks(candles, symbol, existingBreakers);
+      if (updatedBreakers.length !== existingBreakers.length) {
+        this.breakerZones.set(symbol, updatedBreakers);
+        if (updatedBreakers.length > existingBreakers.length) {
+          const newBreaker = updatedBreakers[updatedBreakers.length - 1];
+          info('BREAKER_DETECTED', `${symbol} new breaker zone detected`, {
+            level: newBreaker.level.toFixed(5),
+            side: newBreaker.side,
+            tradeSide: newBreaker.tradeSide
+          });
+        }
       }
       
       // Send scanning status if no setup found
@@ -1600,14 +1643,115 @@ export class SweepFVGStrategy {
     }
   }
 
-  // Recover pending orders from JSON database (survives restarts)
+  /**
+   * Sync pending orders from MT5 directly
+   * This handles cases where the bot crashed after placing an order but before saving to DB
+   */
+  private async syncPendingOrdersFromMT5(): Promise<void> {
+    try {
+      // Get all pending orders from MT5
+      const pendingOrders = await this.connector.getPendingOrders();
+      
+      if (!pendingOrders || pendingOrders.length === 0) {
+        info('SYNC', 'No pending orders found in MT5', {});
+        return;
+      }
+      
+      info('SYNC', `Found ${pendingOrders.length} pending order(s) in MT5`, {});
+      
+      for (const order of pendingOrders) {
+        const symbol = order.symbol;
+        
+        // Check if this order is for one of our symbols
+        if (!this.config.symbols.includes(symbol)) continue;
+        
+        // Check if it's a SweepFVG order (by comment)
+        const comment = order.comment || '';
+        if (!comment.includes('SweepFVG')) {
+          info('SYNC', `${symbol} order ${order.ticket} not a SweepFVG order - skipping`, { comment });
+          continue;
+        }
+        
+        // Check if we already have this in DB
+        if (this.orderDB.hasPendingOrder(symbol)) {
+          const dbOrder = this.orderDB.getPendingOrder(symbol);
+          if (dbOrder && dbOrder.ticket === order.ticket) {
+            // Already synced
+            continue;
+          }
+        }
+        
+        // Determine side from order type
+        const side: 'BUY' | 'SELL' = order.type_description?.includes('BUY') ? 'BUY' : 'SELL';
+        
+        // Create pending setup from MT5 order
+        const setup: PendingSetup = {
+          symbol,
+          side,
+          sweepLevel: order.price_open,
+          sweepTime: new Date(),  // We don't know when it was placed
+          sweepSession: 'london',
+          fvg: null,
+          candlesSinceSweep: 0,
+          lastCandleTime: 0,
+          entryPrice: order.price_open,
+          sl: order.sl,
+          tp: order.tp,
+          status: 'pending_order',
+          setupType: 'reversal',  // Default
+          pendingOrderTicket: order.ticket,
+          pendingOrderType: order.type_description || 'LIMIT',
+          pendingOrderPlacedAt: new Date()
+        };
+        
+        // Save to memory
+        this.pendingSetups.set(symbol, setup);
+        
+        // Save to DB for persistence
+        this.orderDB.addPendingOrder({
+          ticket: order.ticket,
+          symbol,
+          type: order.type_description || 'LIMIT',
+          side,
+          entryPrice: order.price_open,
+          sl: order.sl,
+          tp: order.tp,
+          volume: order.volume,
+          placedAt: new Date().toISOString(),
+          setupType: 'reversal'
+        });
+        
+        info('SYNC', `Synced MT5 pending order for ${symbol}`, {
+          ticket: order.ticket,
+          type: order.type_description,
+          entry: order.price_open,
+          sl: order.sl,
+          tp: order.tp
+        });
+        
+        // Send to frontend
+        await this.sendSetupToAPI(symbol, setup, order.price_open);
+      }
+    } catch (err) {
+      warn('SYNC', `Failed to sync pending orders from MT5: ${err}`);
+    }
+  }
+
+  // Recover pending orders from JSON database AND MT5 (survives restarts)
   private async recoverPendingOrders(): Promise<void> {
     try {
       // Clean up any stale orders first
       this.orderDB.cleanupStale();
       
-      // Get all pending orders and recreate setups for them
+      // FIRST: Check MT5 for any pending orders we might have missed
+      // This handles cases where bot crashed after placing order but before saving to DB
+      await this.syncPendingOrdersFromMT5();
+      
+      // SECOND: Get all pending orders from DB and recreate setups for them
       for (const symbol of this.config.symbols) {
+        // Skip if we already have a pending setup (from MT5 sync)
+        if (this.pendingSetups.has(symbol)) continue;
+        
         const pendingOrders = this.orderDB.getSymbolPendingOrders(symbol);
         
         for (const order of pendingOrders) {
@@ -1754,6 +1898,48 @@ export class SweepFVGStrategy {
     
     const config = isXAU ? this.config.xau : this.config.fx;
     
+    // Update Zone Manager with latest zones (continuous scanning)
+    const breakers = this.breakerZones.get(symbol) || [];
+    const allZones = this.zoneManager.updateZones(symbol, candles, currentPrice, setup.side, breakers);
+    
+    // Log zone summary every few candles for visibility
+    if (setup.candlesSinceSweep % 3 === 0 && allZones.length > 0) {
+      const summary = this.zoneManager.getZoneSummary(symbol);
+      const detailed = this.zoneManager.getDetailedZoneSummary(symbol, isXAU);
+      info('ZONE_SCAN', `${symbol} ${setup.side} ${summary}`, {
+        zones: detailed,
+        inRange: allZones.length,
+        closest: allZones[0] ? `${allZones[0].type} at ${allZones[0].midpoint.toFixed(isXAU ? 2 : 5)} (${allZones[0].distancePips.toFixed(0)} pips)` : 'none'
+      });
+    }
+    
+    // Step 0: Check for sweep-to-breaker conversion
+    // If price CLOSES beyond sweep level, the sweep failed - convert to breaker zone
+    if (setup.status === 'waiting_fvg' || setup.status === 'waiting_ob') {
+      const sweepBroken = this.checkSweepBroken(setup, candles, currentPrice, pipSize);
+      if (sweepBroken) {
+        // Convert to breaker zone
+        const breakerZone = sweepToBreaker(setup.sweepLevel, setup.side, candles, symbol);
+        if (breakerZone) {
+          // Add to breaker zones for this symbol
+          const existingBreakers = this.breakerZones.get(symbol) || [];
+          existingBreakers.push(breakerZone);
+          this.breakerZones.set(symbol, existingBreakers);
+          
+          info('SWEEP_TO_BREAKER', `${symbol} sweep failed - converted to ${breakerZone.tradeSide} breaker zone`, {
+            level: breakerZone.level.toFixed(isXAU ? 2 : 5),
+            originalSide: setup.side,
+            newTradeSide: breakerZone.tradeSide
+          });
+        }
+        
+        // Remove the sweep setup
+        this.pendingSetups.delete(symbol);
+        await this.sendSetupToAPI(symbol, null);
+        return;
+      }
+    }
+    
     // Step 1: Look for FVG if we don't have one (reversal setup)
     if (setup.status === 'waiting_fvg') {
       const fvgs = detectFVG(candles);
@@ -1799,34 +1985,59 @@ export class SweepFVGStrategy {
           currentPrice
         });
       } else {
-        // No reversal FVG - check for CONTINUATION pattern
-        // If price continues strongly in sweep direction, look for continuation entry
-        const continuationDetected = this.checkContinuation(setup, currentPrice, pipSize, config);
-        
-        if (continuationDetected) {
-          setup.setupType = 'continuation';
-          setup.status = 'continuation';
-          
-          // Calculate continuation entry levels
-          this.calculateContinuationLevels(setup, currentPrice, isXAU, pipSize);
-          
-          info('CONTINUATION', `${symbol} continuation detected - no reversal, going with trend`, {
-            originalSide: setup.side,
-            newSide: setup.side === 'BUY' ? 'SELL' : 'BUY',  // Flip direction
-            entry: setup.entryPrice,
-            sl: setup.sl,
-            tp: setup.tp,
-            currentPrice
-          });
-          
-          // IMMEDIATELY place pending order for continuation
-          if (setup.entryPrice && setup.sl && setup.tp) {
-            info('CONTINUATION', `${symbol} placing pending order for continuation`, {
-              entry: setup.entryPrice,
-              current: currentPrice
+        // No FVG yet - after 3 candles, look for Order Block as alternative
+        if (setup.candlesSinceSweep >= 3 && !setup.orderBlock) {
+          const ob = findRelevantOB(candles, setup.side, symbol);
+          if (ob) {
+            setup.orderBlock = ob;
+            setup.status = 'waiting_ob';
+            setup.setupType = 'order_block';
+            
+            info('ORDER_BLOCK', `${symbol} no FVG - found ${ob.side} Order Block as alternative`, {
+              obHigh: ob.high.toFixed(isXAU ? 2 : 5),
+              obLow: ob.low.toFixed(isXAU ? 2 : 5),
+              strength: ob.strength,
+              impulsePips: ob.impulsePips.toFixed(1)
             });
-            await this.executeEntry(setup);
-            this.failedSweepAttempts.set(symbol, 0);
+          }
+        }
+        
+        // Check for CONTINUATION pattern (price ran away in sweep direction)
+        if (setup.status === 'waiting_fvg') {
+          const continuationDetected = this.checkContinuation(setup, currentPrice, pipSize, config);
+          
+          if (continuationDetected) {
+            setup.setupType = 'continuation';
+            setup.status = 'waiting_continuation_retest';  // Wait for FVG/OB retest, don't enter immediately!
+            
+            // Look for FVG or OB to use as entry zone
+            const fvgs = detectFVG(candles);
+            const validFVG = fvgs.find(fvg => {
+              if (setup.side === 'BUY' && fvg.side === 'BULL') return true;
+              if (setup.side === 'SELL' && fvg.side === 'BEAR') return true;
+              return false;
+            });
+            
+            if (validFVG) {
+              setup.fvg = validFVG;
+            }
+            
+            // Also look for Order Block
+            const ob = findRelevantOB(candles, setup.side, symbol);
+            if (ob) {
+              setup.orderBlock = ob;
+            }
+            
+            info('CONTINUATION', `${symbol} continuation detected - waiting for FVG/OB retest`, {
+              side: setup.side,
+              hasFVG: !!setup.fvg,
+              hasOB: !!setup.orderBlock,
+              fvgZone: setup.fvg ? `${setup.fvg.low.toFixed(isXAU ? 2 : 5)} - ${setup.fvg.high.toFixed(isXAU ? 2 : 5)}` : 'none',
+              obZone: setup.orderBlock ? `${setup.orderBlock.low.toFixed(isXAU ? 2 : 5)} - ${setup.orderBlock.high.toFixed(isXAU ? 2 : 5)}` : 'none',
+              currentPrice
+            });
+            
+            // Don't enter yet - wait for retest!
             return;
           }
         }
@@ -1849,6 +2060,383 @@ export class SweepFVGStrategy {
           this.lookForTrendEntry(symbol, candles, currentPrice, isXAU, pipSize);
         }
         
+        this.pendingSetups.delete(symbol);
+        return;
+      }
+    }
+    
+    // Step 1.3: Wait for Order Block retest (alternative to FVG)
+    if (setup.status === 'waiting_ob' && setup.orderBlock) {
+      const ob = setup.orderBlock;
+      const currentCandle = candles[candles.length - 1];
+      
+      // Check if price is in the OB zone
+      const inOBZone = (setup.side === 'BUY')
+        ? (currentCandle.low <= ob.bodyHigh && currentCandle.low >= ob.low)
+        : (currentCandle.high >= ob.bodyLow && currentCandle.high <= ob.high);
+      
+      if (inOBZone) {
+        // Check for rejection at OB
+        const hasRejection = this.checkOBRejection(currentCandle, ob, setup.side);
+        
+        if (hasRejection) {
+          info('ORDER_BLOCK', `${symbol} rejection at Order Block!`, {
+            side: setup.side,
+            obZone: `${ob.bodyLow.toFixed(isXAU ? 2 : 5)} - ${ob.bodyHigh.toFixed(isXAU ? 2 : 5)}`
+          });
+          
+          // Calculate entry levels same as FVG rejection
+          setup.status = 'waiting_entry';
+          setup.entryPrice = currentCandle.close;
+          
+          // Get M5 swing for SL if not already set
+          if (!setup.m5SwingLow && !setup.m5SwingHigh) {
+            const m5SwingLevel = await this.getM5SwingLevel(symbol, setup.side);
+            if (m5SwingLevel) {
+              if (setup.side === 'BUY') setup.m5SwingLow = m5SwingLevel;
+              else setup.m5SwingHigh = m5SwingLevel;
+            }
+          }
+          
+          // SL calculation
+          const slBuffer = isXAU ? 0.5 : isJPY ? 0.02 : 0.0002;
+          if (setup.side === 'BUY' && setup.m5SwingLow) {
+            setup.sl = setup.m5SwingLow - slBuffer;
+          } else if (setup.side === 'SELL' && setup.m5SwingHigh) {
+            setup.sl = setup.m5SwingHigh + slBuffer;
+          } else {
+            // Fallback to OB-based SL
+            setup.sl = setup.side === 'BUY' ? ob.low - (pipSize * 5) : ob.high + (pipSize * 5);
+          }
+          
+          // Get structure TP if not set
+          if (!setup.m5StructureTP) {
+            const structureTP = await this.getM5StructureTP(symbol, setup.side);
+            if (structureTP) setup.m5StructureTP = structureTP;
+          }
+          
+          // Calculate TP with 2RR minimum (same logic as FVG)
+          const slDistance = Math.abs(setup.entryPrice - setup.sl);
+          const slPips = slDistance / pipSize;
+          
+          if (slPips < 5 || slPips > config.maxSlPips) {
+            warn('ORDER_BLOCK', `${symbol} SL invalid (${slPips.toFixed(1)} pips) - skipping`, {});
+            this.pendingSetups.delete(symbol);
+            return;
+          }
+          
+          // TP calculation with 2RR minimum
+          let structureRR = 0;
+          if (setup.m5StructureTP) {
+            const structureDistance = Math.abs(setup.m5StructureTP - setup.entryPrice);
+            structureRR = structureDistance / slDistance;
+          }
+          
+          if (structureRR >= 2) {
+            setup.tp = setup.m5StructureTP!;
+          } else if (structureRR > 1) {
+            setup.tp = setup.side === 'BUY'
+              ? setup.entryPrice + (slDistance * 2.0)
+              : setup.entryPrice - (slDistance * 2.0);
+          } else if (structureRR <= 1 && setup.m5StructureTP) {
+            warn('ORDER_BLOCK', `${symbol} structure TP only ${structureRR.toFixed(1)}RR - skipping`, {});
+            this.pendingSetups.delete(symbol);
+            return;
+          } else {
+            setup.tp = setup.side === 'BUY'
+              ? setup.entryPrice + (slDistance * 2.0)
+              : setup.entryPrice - (slDistance * 2.0);
+          }
+          
+          await this.executeEntry(setup);
+          this.failedSweepAttempts.set(symbol, 0);
+          return;
+        }
+      }
+      
+      // Expire OB setup after max bars
+      if (setup.candlesSinceSweep > this.config.fvg.maxAgeBars + 3) {
+        info('ORDER_BLOCK', `${symbol} OB setup expired - no retest (${setup.candlesSinceSweep} bars)`, {});
+        this.pendingSetups.delete(symbol);
+        return;
+      }
+    }
+    
+    // Step 1.4: Wait for CONTINUATION retest (FVG or OB retest + rejection)
+    if (setup.status === 'waiting_continuation_retest') {
+      const currentCandle = candles[candles.length - 1];
+      
+      // Check FVG retest first (if we have one)
+      if (setup.fvg) {
+        const fvg = setup.fvg;
+        const priceInFVG = (setup.side === 'BUY')
+          ? (currentCandle.low <= fvg.high && currentCandle.high >= fvg.low)
+          : (currentCandle.high >= fvg.low && currentCandle.low <= fvg.high);
+        
+        if (priceInFVG) {
+          const hasRejection = isRejectionCandle(currentCandle, setup.side, fvg.high, fvg.low);
+          
+          if (hasRejection) {
+            info('CONTINUATION', `${symbol} FVG retest rejection - entering!`, {
+              side: setup.side,
+              fvgZone: `${fvg.low.toFixed(isXAU ? 2 : 5)} - ${fvg.high.toFixed(isXAU ? 2 : 5)}`
+            });
+            
+            // Calculate entry levels with SL 5-10 pips beyond FVG
+            setup.entryPrice = currentCandle.close;
+            const slBufferPips = isXAU ? 7 : isJPY ? 0.07 : 0.0007;  // 7 pips buffer
+            setup.sl = setup.side === 'BUY' ? fvg.low - slBufferPips : fvg.high + slBufferPips;
+            
+            // Calculate TP with dynamic RR (2RR minimum, use structure if better)
+            const slDistance = Math.abs(setup.entryPrice - setup.sl);
+            const slPips = slDistance / pipSize;
+            
+            if (slPips < 5 || slPips > config.maxSlPips) {
+              warn('CONTINUATION', `${symbol} SL invalid (${slPips.toFixed(1)} pips) - skipping`, {});
+              this.pendingSetups.delete(symbol);
+              return;
+            }
+            
+            // Get structure TP
+            const structureTP = await this.getM5StructureTP(symbol, setup.side);
+            let structureRR = 0;
+            if (structureTP) {
+              const structureDistance = Math.abs(structureTP - setup.entryPrice);
+              structureRR = structureDistance / slDistance;
+            }
+            
+            // Dynamic TP: <1RR skip, 1-2RR extend to 2RR, >=2RR use structure
+            if (structureRR >= 2) {
+              setup.tp = structureTP!;
+            } else if (structureRR > 1) {
+              setup.tp = setup.side === 'BUY'
+                ? setup.entryPrice + (slDistance * 2.0)
+                : setup.entryPrice - (slDistance * 2.0);
+            } else if (structureRR <= 1 && structureTP) {
+              warn('CONTINUATION', `${symbol} structure TP only ${structureRR.toFixed(1)}RR - skipping`, {});
+              this.pendingSetups.delete(symbol);
+              return;
+            } else {
+              setup.tp = setup.side === 'BUY'
+                ? setup.entryPrice + (slDistance * 2.0)
+                : setup.entryPrice - (slDistance * 2.0);
+            }
+            
+            setup.status = 'waiting_entry';
+            await this.executeEntry(setup);
+            this.failedSweepAttempts.set(symbol, 0);
+            return;
+          }
+        }
+      }
+      
+      // Check OB retest (if we have one and FVG didn't trigger)
+      if (setup.orderBlock) {
+        const ob = setup.orderBlock;
+        const inOBZone = (setup.side === 'BUY')
+          ? (currentCandle.low <= ob.bodyHigh && currentCandle.low >= ob.low)
+          : (currentCandle.high >= ob.bodyLow && currentCandle.high <= ob.high);
+        
+        if (inOBZone) {
+          const hasRejection = this.checkOBRejection(currentCandle, ob, setup.side);
+          
+          if (hasRejection) {
+            info('CONTINUATION', `${symbol} OB retest rejection - entering!`, {
+              side: setup.side,
+              obZone: `${ob.low.toFixed(isXAU ? 2 : 5)} - ${ob.high.toFixed(isXAU ? 2 : 5)}`
+            });
+            
+            // Calculate entry levels with SL 5-10 pips beyond OB
+            setup.entryPrice = currentCandle.close;
+            const slBufferPips = isXAU ? 7 : isJPY ? 0.07 : 0.0007;  // 7 pips buffer
+            setup.sl = setup.side === 'BUY' ? ob.low - slBufferPips : ob.high + slBufferPips;
+            
+            // Calculate TP with dynamic RR
+            const slDistance = Math.abs(setup.entryPrice - setup.sl);
+            const slPips = slDistance / pipSize;
+            
+            if (slPips < 5 || slPips > config.maxSlPips) {
+              warn('CONTINUATION', `${symbol} SL invalid (${slPips.toFixed(1)} pips) - skipping`, {});
+              this.pendingSetups.delete(symbol);
+              return;
+            }
+            
+            // Get structure TP
+            const structureTP = await this.getM5StructureTP(symbol, setup.side);
+            let structureRR = 0;
+            if (structureTP) {
+              const structureDistance = Math.abs(structureTP - setup.entryPrice);
+              structureRR = structureDistance / slDistance;
+            }
+            
+            // Dynamic TP: <1RR skip, 1-2RR extend to 2RR, >=2RR use structure
+            if (structureRR >= 2) {
+              setup.tp = structureTP!;
+            } else if (structureRR > 1) {
+              setup.tp = setup.side === 'BUY'
+                ? setup.entryPrice + (slDistance * 2.0)
+                : setup.entryPrice - (slDistance * 2.0);
+            } else if (structureRR <= 1 && structureTP) {
+              warn('CONTINUATION', `${symbol} structure TP only ${structureRR.toFixed(1)}RR - skipping`, {});
+              this.pendingSetups.delete(symbol);
+              return;
+            } else {
+              setup.tp = setup.side === 'BUY'
+                ? setup.entryPrice + (slDistance * 2.0)
+                : setup.entryPrice - (slDistance * 2.0);
+            }
+            
+            setup.status = 'waiting_entry';
+            await this.executeEntry(setup);
+            this.failedSweepAttempts.set(symbol, 0);
+            return;
+          }
+        }
+      }
+      
+      // Expire continuation setup after 12 bars (give price time to retrace)
+      if (setup.candlesSinceSweep > 12) {
+        info('CONTINUATION', `${symbol} continuation setup expired - no retest (${setup.candlesSinceSweep} bars)`, {});;
+        this.pendingSetups.delete(symbol);
+        return;
+      }
+    }
+    
+    // Step 1.45: Wait for TREND retest (FVG or OB retest + rejection)
+    if (setup.status === 'waiting_trend_retest') {
+      const currentCandle = candles[candles.length - 1];
+      
+      // Check FVG retest first (if we have one)
+      if (setup.fvg) {
+        const fvg = setup.fvg;
+        const priceInFVG = (setup.side === 'BUY')
+          ? (currentCandle.low <= fvg.high && currentCandle.high >= fvg.low)
+          : (currentCandle.high >= fvg.low && currentCandle.low <= fvg.high);
+        
+        if (priceInFVG) {
+          const hasRejection = isRejectionCandle(currentCandle, setup.side, fvg.high, fvg.low);
+          
+          if (hasRejection) {
+            info('TREND', `${symbol} FVG retest rejection - entering!`, {
+              side: setup.side,
+              fvgZone: `${fvg.low.toFixed(isXAU ? 2 : 5)} - ${fvg.high.toFixed(isXAU ? 2 : 5)}`
+            });
+            
+            // Calculate entry levels with SL 5-10 pips beyond FVG
+            setup.entryPrice = currentCandle.close;
+            const slBufferPips = isXAU ? 7 : isJPY ? 0.07 : 0.0007;  // 7 pips buffer
+            setup.sl = setup.side === 'BUY' ? fvg.low - slBufferPips : fvg.high + slBufferPips;
+            
+            // Calculate TP with dynamic RR (2RR minimum, use structure if better)
+            const slDistance = Math.abs(setup.entryPrice - setup.sl);
+            const slPips = slDistance / pipSize;
+            
+            if (slPips < 5 || slPips > config.maxSlPips) {
+              warn('TREND', `${symbol} SL invalid (${slPips.toFixed(1)} pips) - skipping`, {});
+              this.pendingSetups.delete(symbol);
+              return;
+            }
+            
+            // Get structure TP
+            const structureTP = await this.getM5StructureTP(symbol, setup.side);
+            let structureRR = 0;
+            if (structureTP) {
+              const structureDistance = Math.abs(structureTP - setup.entryPrice);
+              structureRR = structureDistance / slDistance;
+            }
+            
+            // Dynamic TP: <1RR skip, 1-2RR extend to 2RR, >=2RR use structure
+            if (structureRR >= 2) {
+              setup.tp = structureTP!;
+            } else if (structureRR > 1) {
+              setup.tp = setup.side === 'BUY'
+                ? setup.entryPrice + (slDistance * 2.0)
+                : setup.entryPrice - (slDistance * 2.0);
+            } else if (structureRR <= 1 && structureTP) {
+              warn('TREND', `${symbol} structure TP only ${structureRR.toFixed(1)}RR - skipping`, {});
+              this.pendingSetups.delete(symbol);
+              return;
+            } else {
+              setup.tp = setup.side === 'BUY'
+                ? setup.entryPrice + (slDistance * 2.0)
+                : setup.entryPrice - (slDistance * 2.0);
+            }
+            
+            setup.status = 'waiting_entry';
+            await this.executeEntry(setup);
+            this.failedSweepAttempts.set(symbol, 0);
+            return;
+          }
+        }
+      }
+      
+      // Check OB retest (if we have one and FVG didn't trigger)
+      if (setup.orderBlock) {
+        const ob = setup.orderBlock;
+        const inOBZone = (setup.side === 'BUY')
+          ? (currentCandle.low <= ob.bodyHigh && currentCandle.low >= ob.low)
+          : (currentCandle.high >= ob.bodyLow && currentCandle.high <= ob.high);
+        
+        if (inOBZone) {
+          const hasRejection = this.checkOBRejection(currentCandle, ob, setup.side);
+          
+          if (hasRejection) {
+            info('TREND', `${symbol} OB retest rejection - entering!`, {
+              side: setup.side,
+              obZone: `${ob.low.toFixed(isXAU ? 2 : 5)} - ${ob.high.toFixed(isXAU ? 2 : 5)}`
+            });
+            
+            // Calculate entry levels with SL 5-10 pips beyond OB
+            setup.entryPrice = currentCandle.close;
+            const slBufferPips = isXAU ? 7 : isJPY ? 0.07 : 0.0007;  // 7 pips buffer
+            setup.sl = setup.side === 'BUY' ? ob.low - slBufferPips : ob.high + slBufferPips;
+            
+            // Calculate TP with dynamic RR
+            const slDistance = Math.abs(setup.entryPrice - setup.sl);
+            const slPips = slDistance / pipSize;
+            
+            if (slPips < 5 || slPips > config.maxSlPips) {
+              warn('TREND', `${symbol} SL invalid (${slPips.toFixed(1)} pips) - skipping`, {});
+              this.pendingSetups.delete(symbol);
+              return;
+            }
+            
+            // Get structure TP
+            const structureTP = await this.getM5StructureTP(symbol, setup.side);
+            let structureRR = 0;
+            if (structureTP) {
+              const structureDistance = Math.abs(structureTP - setup.entryPrice);
+              structureRR = structureDistance / slDistance;
+            }
+            
+            // Dynamic TP: <1RR skip, 1-2RR extend to 2RR, >=2RR use structure
+            if (structureRR >= 2) {
+              setup.tp = structureTP!;
+            } else if (structureRR > 1) {
+              setup.tp = setup.side === 'BUY'
+                ? setup.entryPrice + (slDistance * 2.0)
+                : setup.entryPrice - (slDistance * 2.0);
+            } else if (structureRR <= 1 && structureTP) {
+              warn('TREND', `${symbol} structure TP only ${structureRR.toFixed(1)}RR - skipping`, {});
+              this.pendingSetups.delete(symbol);
+              return;
+            } else {
+              setup.tp = setup.side === 'BUY'
+                ? setup.entryPrice + (slDistance * 2.0)
+                : setup.entryPrice - (slDistance * 2.0);
+            }
+            
+            setup.status = 'waiting_entry';
+            await this.executeEntry(setup);
+            this.failedSweepAttempts.set(symbol, 0);
+            return;
+          }
+        }
+      }
+      
+      // Expire trend setup after 12 bars (give price time to retrace)
+      if (setup.candlesSinceSweep > 12) {
+        info('TREND', `${symbol} trend setup expired - no retest (${setup.candlesSinceSweep} bars)`, {});;
         this.pendingSetups.delete(symbol);
         return;
       }
@@ -2014,7 +2602,8 @@ export class SweepFVGStrategy {
     
     // Step 2: Execute entry when setup is ready (has entry, SL, TP)
     // We use pending orders (limit/stop) so we don't need to wait for price
-    if ((setup.status === 'waiting_entry' || setup.status === 'ready' || setup.status === 'continuation' || setup.status === 'trend_entry' || setup.status === 'pattern_entry') && 
+    // Note: continuation and trend_entry now wait for retest via waiting_continuation_retest and waiting_trend_retest
+    if ((setup.status === 'waiting_entry' || setup.status === 'ready' || setup.status === 'pattern_entry') && 
         setup.entryPrice && setup.sl && setup.tp) {
       
       // First check if we MISSED the entry (price moved too far past in profit direction)
@@ -2108,6 +2697,16 @@ export class SweepFVGStrategy {
       return null;  // M15 level check is done in processPendingSetup
     }
     
+    // SKIP sweep-level invalidation for retest waits - they have their own expiry
+    if (setup.status === 'waiting_continuation_retest' || setup.status === 'waiting_trend_retest') {
+      // Only check time limit (60 minutes max for retest)
+      const ageMinutes = (Date.now() - setup.sweepTime.getTime()) / (1000 * 60);
+      if (ageMinutes > 60) {
+        return `waiting for retest too long (${Math.round(ageMinutes)} min)`;
+      }
+      return null;  // Candle-based expiry is done in processPendingSetup
+    }
+    
     // 1. Price hit SL level (would have been stopped out)
     if (setup.sl) {
       if (setup.side === 'BUY' && currentPrice <= setup.sl) {
@@ -2166,41 +2765,40 @@ export class SweepFVGStrategy {
     pipSize: number,
     allowedDirections?: { allowBuy: boolean; allowSell: boolean; m15Trend: string; h1Trend: string }
   ): Promise<void> {
-    // Calculate EMAs for trend direction
+    // Calculate EMAs for trend direction on M5
     const emaFast = this.calculateEMA(candles, 9);
     const emaSlow = this.calculateEMA(candles, 21);
     
     if (!emaFast || !emaSlow) return;
     
+    // Calculate separation for logging/strength tracking (but not for filtering)
     const emaSeparation = Math.abs(emaFast - emaSlow) / pipSize;
-    const minSeparation = isXAU ? 8 : 4; // Minimum EMA separation in pips (increased for December - clearer trends only)
     
-    // Determine trend direction
+    // Simple crossover - no separation required since 4H already confirms direction
+    // EMA 9 > EMA 21 = bullish, EMA 9 < EMA 21 = bearish
     let trendDirection: 'BUY' | 'SELL' | null = null;
-    if (emaFast > emaSlow && emaSeparation >= minSeparation) {
+    if (emaFast > emaSlow) {
       trendDirection = 'BUY';
-    } else if (emaFast < emaSlow && emaSeparation >= minSeparation) {
+    } else if (emaFast < emaSlow) {
       trendDirection = 'SELL';
     }
     
     if (!trendDirection) {
-      info('TREND', `${symbol} no clear trend - EMA separation ${emaSeparation.toFixed(1)} pips (need ${minSeparation})`, {});
+      // EMAs are exactly equal (very rare)
       return;
     }
     
-    // Check if this direction is allowed by MTF
+    // Check if this direction is allowed by 4H trend (MTF)
     if (allowedDirections) {
       if (trendDirection === 'BUY' && !allowedDirections.allowBuy) {
-        info('TREND', `${symbol} M5 trend is BUY but blocked by MTF`, {
-          m15: allowedDirections.m15Trend,
-          h1: allowedDirections.h1Trend
+        info('TREND', `${symbol} M5 trend is BUY but blocked by 4H`, {
+          h4Trend: allowedDirections.h1Trend
         });
         return;
       }
       if (trendDirection === 'SELL' && !allowedDirections.allowSell) {
-        info('TREND', `${symbol} M5 trend is SELL but blocked by MTF`, {
-          m15: allowedDirections.m15Trend,
-          h1: allowedDirections.h1Trend
+        info('TREND', `${symbol} M5 trend is SELL but blocked by 4H`, {
+          h4Trend: allowedDirections.h1Trend
         });
         return;
       }
@@ -2215,6 +2813,149 @@ export class SweepFVGStrategy {
       lastUpdate: new Date()
     });
     
+    // ═══════════════════════════════════════════════════════════════════
+    // ZONE MANAGER: Continuously scan ALL zones in trend direction
+    // Runs every tick to detect new zones and check reactions
+    // ═══════════════════════════════════════════════════════════════════
+    
+    // Get breakers for this symbol
+    const breakers = this.breakerZones.get(symbol) || [];
+    
+    // Update Zone Manager with all zones in trend direction (runs every tick)
+    const zones = this.zoneManager.updateZones(symbol, candles, currentPrice, trendDirection, breakers);
+    
+    // Log zone summary with prices (every tick for visibility)
+    const zoneSummary = this.zoneManager.getZoneSummary(symbol);
+    const detailedZones = this.zoneManager.getDetailedZoneSummary(symbol, isXAU);
+    
+    if (zones.length > 0) {
+      info('TREND_SCAN', `${symbol} ${trendDirection}: ${zoneSummary}`, {
+        zones: detailedZones,
+        closestZone: `${zones[0].type} at ${zones[0].midpoint.toFixed(isXAU ? 2 : 5)} (${zones[0].distancePips.toFixed(0)} pips)`,
+        priceToZone: `${zones[0].distancePips.toFixed(0)} pips`
+      });
+      
+      // Check each zone for reaction (enter on first strong rejection)
+      for (const zone of zones) {
+        const reaction = this.zoneManager.checkReaction(symbol, zone, candles, currentPrice);
+        
+        if (reaction.hasReaction && reaction.isRejection && reaction.strength >= 50) {
+          // Strong rejection at zone - prepare entry
+          const entryPrice = reaction.entryPrice || currentPrice;
+          const config = isXAU ? this.config.xau : this.config.fx;
+          const isJPY = isJPYSymbol(symbol);
+          
+          info('TREND_ZONE_ENTRY', `${symbol} ${zone.type.toUpperCase()} rejection in trend mode!`, {
+            side: trendDirection,
+            strength: reaction.strength,
+            entryPrice: entryPrice.toFixed(isXAU ? 2 : 5)
+          });
+          
+          // Get M5 swing for SL
+          const m5SwingLevel = await this.getM5SwingLevel(symbol, trendDirection);
+          
+          // Calculate SL
+          let sl: number;
+          const slBuffer = isXAU ? 0.5 : isJPY ? 0.02 : 0.0002;
+          
+          if (m5SwingLevel) {
+            sl = trendDirection === 'BUY' ? m5SwingLevel - slBuffer : m5SwingLevel + slBuffer;
+          } else {
+            // Fallback to zone-based SL
+            sl = trendDirection === 'BUY' ? zone.low - (pipSize * 5) : zone.high + (pipSize * 5);
+          }
+          
+          // Validate SL distance
+          const slPips = Math.abs(entryPrice - sl) / pipSize;
+          if (slPips < 5 || slPips > config.maxSlPips) {
+            info('TREND_ZONE', `${symbol} SL invalid (${slPips.toFixed(1)} pips) - trying next zone`, {});
+            continue;
+          }
+          
+          // Calculate TP with 2RR minimum
+          const slDistance = Math.abs(entryPrice - sl);
+          const m5StructureTP = await this.getM5StructureTP(symbol, trendDirection);
+          
+          let tp: number;
+          if (m5StructureTP) {
+            const structureDistance = Math.abs(m5StructureTP - entryPrice);
+            const structureRR = structureDistance / slDistance;
+            
+            if (structureRR >= 2) {
+              tp = m5StructureTP;
+            } else {
+              tp = trendDirection === 'BUY' 
+                ? entryPrice + (slDistance * 2.0) 
+                : entryPrice - (slDistance * 2.0);
+            }
+          } else {
+            tp = trendDirection === 'BUY' 
+              ? entryPrice + (slDistance * 2.0) 
+              : entryPrice - (slDistance * 2.0);
+          }
+          
+          // Create setup
+          const currentCandleTime = candles[candles.length - 1].time;
+          const setup: PendingSetup = {
+            symbol,
+            side: trendDirection,
+            sweepLevel: zone.midpoint,
+            sweepTime: new Date(),
+            sweepSession: 'london',
+            fvg: zone.type === 'fvg' ? zone.originalFVG! : null,
+            orderBlock: zone.type === 'order_block' ? zone.originalOB : undefined,
+            breakerZone: zone.type === 'breaker' ? zone.originalBreaker : undefined,
+            candlesSinceSweep: 0,
+            lastCandleTime: currentCandleTime,
+            entryPrice,
+            sl,
+            tp,
+            status: 'waiting_entry',  // Zone rejection already confirmed, ready to enter
+            setupType: 'trend',
+            m5SwingLow: trendDirection === 'BUY' && m5SwingLevel ? m5SwingLevel : undefined,
+            m5SwingHigh: trendDirection === 'SELL' && m5SwingLevel ? m5SwingLevel : undefined,
+            m5StructureTP: m5StructureTP ?? undefined
+          };
+          
+          this.pendingSetups.set(symbol, setup);
+          await this.executeEntry(setup);
+          
+          // Mark zone as used
+          this.zoneManager.invalidateZone(symbol, zone.id);
+          
+          info('TREND', `${symbol} TREND ${trendDirection} entry via ${zone.type.toUpperCase()}`, {
+            entry: entryPrice.toFixed(isXAU ? 2 : 5),
+            sl: sl.toFixed(isXAU ? 2 : 5),
+            tp: tp.toFixed(isXAU ? 2 : 5),
+            zoneType: zone.type,
+            rejectionStrength: reaction.strength
+          });
+          
+          return;  // Found entry, exit
+        }
+        
+        // Zone broken - log and continue to next
+        if (reaction.hasReaction && !reaction.isRejection) {
+          info('TREND_ZONE', `${symbol} ${zone.type} zone broken - checking next zone`, {
+            reason: reaction.reason
+          });
+        }
+      }
+      
+      // No zone entry yet - check if structure is broken
+      if (this.zoneManager.isStructureBroken(symbol, trendDirection)) {
+        info('TREND_STRUCTURE', `${symbol} all ${trendDirection} zones broken - resetting`, {});
+        this.zoneManager.clearZones(symbol);
+      }
+    } else {
+      // No zones in valid range (20-100 pips) - log scanning status
+      info('TREND_SCAN', `${symbol} ${trendDirection}: No zones in 20-100 pip range - scanning...`, {
+        price: currentPrice.toFixed(isXAU ? 2 : 5),
+        allZones: detailedZones || 'none'
+      });
+    }
+    
+    // Fallback: Also look for FVG the traditional way (for cases when zone manager doesn't trigger)
     // Look for FVG in trend direction for entry
     const fvgs = detectFVG(candles);
     const trendFVG = fvgs.find(fvg => {
@@ -2227,7 +2968,10 @@ export class SweepFVGStrategy {
       const config = isXAU ? this.config.xau : this.config.fx;
       const currentCandleTime = candles[candles.length - 1].time;
       
-      // Create trend entry setup
+      // Also look for Order Block
+      const ob = findRelevantOB(candles, trendDirection, symbol);
+      
+      // Create trend entry setup - WAIT for retest, don't enter immediately!
       const setup: PendingSetup = {
         symbol,
         side: trendDirection,
@@ -2235,53 +2979,38 @@ export class SweepFVGStrategy {
         sweepTime: new Date(),
         sweepSession: 'london',
         fvg: trendFVG,
+        orderBlock: ob || undefined,
         candlesSinceSweep: 0,
-        lastCandleTime: currentCandleTime,  // Use actual candle time
+        lastCandleTime: currentCandleTime,
         entryPrice: null,
         sl: null,
         tp: null,
-        status: 'trend_entry',
+        status: 'waiting_trend_retest',  // Wait for FVG/OB retest, don't enter immediately!
         setupType: 'trend',
         failedAttempts: 0
       };
       
-      // Calculate entry levels for trend trade
-      const fvgSize = trendFVG.high - trendFVG.low;
-      const buffer = fvgSize * 0.3;
-      
-      if (trendDirection === 'BUY') {
-        setup.entryPrice = trendFVG.low + buffer;
-        setup.sl = trendFVG.low - (config.maxSlPips * pipSize);
-        const slDistance = setup.entryPrice - setup.sl;
-        setup.tp = setup.entryPrice + (slDistance * config.minRR);
-      } else {
-        setup.entryPrice = trendFVG.high - buffer;
-        setup.sl = trendFVG.high + (config.maxSlPips * pipSize);
-        const slDistance = setup.sl - setup.entryPrice;
-        setup.tp = setup.entryPrice - (slDistance * config.minRR);
-      }
-      
       this.pendingSetups.set(symbol, setup);
       
-      info('TREND', `${symbol} TREND ${trendDirection} setup created`, {
+      info('TREND', `${symbol} TREND ${trendDirection} setup created - waiting for FVG/OB retest`, {
         emaFast: emaFast.toFixed(5),
         emaSlow: emaSlow.toFixed(5),
         separation: emaSeparation.toFixed(1),
-        fvgHigh: trendFVG.high,
-        fvgLow: trendFVG.low,
-        entry: setup.entryPrice?.toFixed(5),
-        sl: setup.sl?.toFixed(5),
-        tp: setup.tp?.toFixed(5)
+        fvgZone: `${trendFVG.low.toFixed(isXAU ? 2 : 5)} - ${trendFVG.high.toFixed(isXAU ? 2 : 5)}`,
+        hasOB: !!ob,
+        obZone: ob ? `${ob.low.toFixed(isXAU ? 2 : 5)} - ${ob.high.toFixed(isXAU ? 2 : 5)}` : 'none'
       });
       
-      // IMMEDIATELY place pending order since setup is ready
-      // Don't wait for next tick - execute now
-      await this.executeEntry(setup);
+      // Don't enter yet - wait for retest!
     } else {
-      info('TREND', `${symbol} trend is ${trendDirection} but no FVG for entry yet`, {
-        emaFast: emaFast.toFixed(5),
-        emaSlow: emaSlow.toFixed(5),
-        separation: emaSeparation.toFixed(1)
+      // No FVG from traditional detection either
+      const zoneSummary = this.zoneManager.getZoneSummary(symbol);
+      const detailedZones = this.zoneManager.getDetailedZoneSummary(symbol, isXAU);
+      info('TREND', `${symbol} trend is ${trendDirection} - waiting for zone reaction`, {
+        emaFast: emaFast.toFixed(isXAU ? 2 : 5),
+        emaSlow: emaSlow.toFixed(isXAU ? 2 : 5),
+        separation: emaSeparation.toFixed(1),
+        zones: detailedZones || zoneSummary
       });
     }
   }
@@ -2289,6 +3018,7 @@ export class SweepFVGStrategy {
   /**
    * Look for Double/Triple Top and Bottom reversal patterns
    * These indicate trend exhaustion and potential reversal
+   * NOTE: These patterns BYPASS the 4H trend filter because they are reversal signals
    */
   private async lookForReversalPattern(
     symbol: string,
@@ -2301,23 +3031,12 @@ export class SweepFVGStrategy {
     
     if (!pattern) return;
     
-    // Check if this direction is allowed by MTF
-    if (allowedDirections) {
-      if (pattern.side === 'BUY' && !allowedDirections.allowBuy) {
-        info('PATTERN', `${symbol} ${pattern.type} is BUY but blocked by MTF trend`, {
-          m15: allowedDirections.m15Trend,
-          h1: allowedDirections.h1Trend
-        });
-        return;
-      }
-      if (pattern.side === 'SELL' && !allowedDirections.allowSell) {
-        info('PATTERN', `${symbol} ${pattern.type} is SELL but blocked by MTF trend`, {
-          m15: allowedDirections.m15Trend,
-          h1: allowedDirections.h1Trend
-        });
-        return;
-      }
-    }
+    // Double/Triple Top/Bottom patterns bypass MTF trend filter
+    // They are reversal signals by nature and have their own safety (SL at pattern extreme, RR checks)
+    info('PATTERN', `${symbol} ${pattern.type} detected - bypassing trend filter (reversal pattern)`, {
+      side: pattern.side,
+      strength: pattern.strength
+    });
     
     // Only trade patterns with strength >= 50
     if (pattern.strength < 50) {
@@ -2535,6 +3254,317 @@ export class SweepFVGStrategy {
 
   /**
    * Check if price is continuing in sweep direction instead of reversing
+  /**
+   * Check if sweep level has been broken (price closed through)
+   * This converts a failed sweep into a breaker zone opportunity
+   */
+  private checkSweepBroken(
+    setup: PendingSetup,
+    candles: Candle[],
+    currentPrice: number,
+    pipSize: number
+  ): boolean {
+    const currentCandle = candles[candles.length - 1];
+    const breakThreshold = pipSize * 10; // Need 10+ pips break to confirm
+    
+    if (setup.side === 'BUY') {
+      // BUY setup means we swept LOW - if price CLOSES below sweep low, it's broken
+      if (currentCandle.close < setup.sweepLevel - breakThreshold) {
+        return true;
+      }
+    } else {
+      // SELL setup means we swept HIGH - if price CLOSES above sweep high, it's broken
+      if (currentCandle.close > setup.sweepLevel + breakThreshold) {
+        return true;
+      }
+    }
+    
+    return false;
+  }
+
+  /**
+   * Check for rejection at Order Block zone
+   */
+  private checkOBRejection(
+    candle: Candle,
+    ob: OrderBlock,
+    side: 'BUY' | 'SELL'
+  ): boolean {
+    const bodyHigh = Math.max(candle.open, candle.close);
+    const bodyLow = Math.min(candle.open, candle.close);
+    const upperWick = candle.high - bodyHigh;
+    const lowerWick = bodyLow - candle.low;
+    const candleBody = bodyHigh - bodyLow;
+    const candleRange = candle.high - candle.low;
+    
+    // Need some body size to be valid
+    if (candleBody < candleRange * 0.2) return false;
+    
+    if (side === 'BUY') {
+      // Bullish OB rejection: wick into OB zone, body above, bullish close
+      const wickedIntoOB = candle.low <= ob.bodyHigh && candle.low >= ob.low;
+      const bodyAboveOB = bodyLow >= ob.bodyLow;
+      const bullishClose = candle.close > candle.open;
+      const lowerWickDominant = lowerWick > upperWick;
+      
+      return wickedIntoOB && bodyAboveOB && bullishClose && lowerWickDominant;
+    } else {
+      // Bearish OB rejection: wick into OB zone, body below, bearish close
+      const wickedIntoOB = candle.high >= ob.bodyLow && candle.high <= ob.high;
+      const bodyBelowOB = bodyHigh <= ob.bodyHigh;
+      const bearishClose = candle.close < candle.open;
+      const upperWickDominant = upperWick > lowerWick;
+      
+      return wickedIntoOB && bodyBelowOB && bearishClose && upperWickDominant;
+    }
+  }
+
+  /**
+   * Check for breaker block retest and setup entry if valid
+   */
+  private async checkBreakerEntries(
+    symbol: string,
+    candles: Candle[],
+    currentPrice: number,
+    allowedDirections?: { allowBuy: boolean; allowSell: boolean; m15Trend: string; h1Trend: string }
+  ): Promise<void> {
+    const zones = this.breakerZones.get(symbol);
+    if (!zones || zones.length === 0) return;
+    
+    const isXAU = isXAUSymbol(symbol);
+    const isJPY = isJPYSymbol(symbol);
+    const pipSize = getPipSize(symbol);
+    const config = isXAU ? this.config.xau : this.config.fx;
+    
+    // Update zones based on current price action
+    const updatedZones = updateBreakerZones(zones, currentPrice, candles);
+    this.breakerZones.set(symbol, updatedZones);
+    
+    // Check each zone for retest entry
+    for (const zone of updatedZones) {
+      // Check trend alignment - breakers need 4H trend confirmation
+      if (allowedDirections) {
+        if (zone.tradeSide === 'BUY' && !allowedDirections.allowBuy) continue;
+        if (zone.tradeSide === 'SELL' && !allowedDirections.allowSell) continue;
+      }
+      
+      // Check for retest entry
+      const entry = checkBreakerRetest(zone, candles, currentPrice, symbol);
+      if (!entry) continue;
+      
+      // Validate SL distance
+      const slPips = Math.abs(entry.entryPrice - entry.sl) / pipSize;
+      if (slPips < 5 || slPips > config.maxSlPips) {
+        continue;
+      }
+      
+      // Valid breaker entry!
+      info('BREAKER', `${symbol} valid breaker retest entry`, {
+        side: entry.zone.tradeSide,
+        entry: entry.entryPrice.toFixed(isXAU ? 2 : 5),
+        sl: entry.sl.toFixed(isXAU ? 2 : 5),
+        tp: entry.tp.toFixed(isXAU ? 2 : 5),
+        rr: entry.rr.toFixed(1)
+      });
+      
+      // Create pending setup for breaker
+      const setup: PendingSetup = {
+        symbol,
+        side: entry.zone.tradeSide,
+        sweepLevel: entry.zone.level,
+        sweepTime: new Date(),
+        sweepSession: 'london',
+        fvg: null,
+        breakerZone: entry.zone,
+        candlesSinceSweep: 0,
+        lastCandleTime: candles[candles.length - 1].time,
+        entryPrice: entry.entryPrice,
+        sl: entry.sl,
+        tp: entry.tp,
+        status: 'waiting_entry',
+        setupType: 'breaker'
+      };
+      
+      this.pendingSetups.set(symbol, setup);
+      await this.executeEntry(setup);
+      
+      // Remove used zone
+      const remainingZones = updatedZones.filter(z => z !== zone);
+      this.breakerZones.set(symbol, remainingZones);
+      
+      return;
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // ZONE-BASED ENTRY (CONTINUOUS ZONE SCANNING)
+  // ═══════════════════════════════════════════════════════════════════
+
+  /**
+   * Check all zones (FVG, OB, Breaker) for reaction-based entry
+   * This is the new continuous zone scanning approach:
+   * - Scan ALL zones in valid range (20-100 pips)
+   * - Cluster nearby zones (<20 pips apart)
+   * - Enter on strong rejection at ANY zone
+   * - Skip zone and move to next if weak reaction or break
+   * - Stop looking when all zones break (structure failure)
+   */
+  private async checkZoneEntries(
+    symbol: string,
+    candles: Candle[],
+    currentPrice: number,
+    tradeSide: 'BUY' | 'SELL',
+    allowedDirections?: { allowBuy: boolean; allowSell: boolean; m15Trend: string; h1Trend: string }
+  ): Promise<boolean> {
+    const isXAU = isXAUSymbol(symbol);
+    const isJPY = isJPYSymbol(symbol);
+    const pipSize = getPipSize(symbol);
+    const config = isXAU ? this.config.xau : this.config.fx;
+    
+    // Check trend alignment
+    if (allowedDirections) {
+      if (tradeSide === 'BUY' && !allowedDirections.allowBuy) return false;
+      if (tradeSide === 'SELL' && !allowedDirections.allowSell) return false;
+    }
+    
+    // Get breakers for this symbol
+    const breakers = this.breakerZones.get(symbol) || [];
+    
+    // Update zones with latest candle data
+    const zones = this.zoneManager.updateZones(symbol, candles, currentPrice, tradeSide, breakers);
+    
+    if (zones.length === 0) {
+      return false;
+    }
+    
+    // Log zone summary periodically with prices
+    const summary = this.zoneManager.getZoneSummary(symbol);
+    const detailed = this.zoneManager.getDetailedZoneSummary(symbol, isXAU);
+    info('ZONES', `${symbol} ${tradeSide}: ${summary}`, {
+      zones: detailed,
+      closestZone: zones[0] ? `${zones[0].type} at ${zones[0].midpoint.toFixed(isXAU ? 2 : 5)} (${zones[0].distancePips.toFixed(0)} pips)` : 'none'
+    });
+    
+    // Cluster zones
+    const clusters = this.zoneManager.clusterZones(symbol, zones);
+    
+    // Check each zone for reaction
+    for (const zone of zones) {
+      const reaction = this.zoneManager.checkReaction(symbol, zone, candles, currentPrice);
+      
+      if (!reaction.hasReaction) continue;
+      
+      // Check if zone is broken
+      if (!reaction.isRejection) {
+        info('ZONE_BROKEN', `${symbol} ${zone.type} zone broken - skipping to next zone`, {
+          zoneMid: zone.midpoint.toFixed(isXAU ? 2 : 5),
+          reason: reaction.reason
+        });
+        continue;
+      }
+      
+      // REJECTION DETECTED - prepare entry
+      if (reaction.isRejection && reaction.strength >= 50) {
+        const entryPrice = reaction.entryPrice || currentPrice;
+        
+        info('ZONE_REJECTION', `${symbol} ${zone.type} rejection detected!`, {
+          side: tradeSide,
+          strength: reaction.strength,
+          entryPrice: entryPrice.toFixed(isXAU ? 2 : 5),
+          zone: `${zone.low.toFixed(isXAU ? 2 : 5)} - ${zone.high.toFixed(isXAU ? 2 : 5)}`
+        });
+        
+        // Get M5 swing for SL
+        const m5SwingLevel = await this.getM5SwingLevel(symbol, tradeSide);
+        
+        // Calculate SL
+        let sl: number;
+        const slBuffer = isXAU ? 0.5 : isJPY ? 0.02 : 0.0002;
+        
+        if (m5SwingLevel) {
+          sl = tradeSide === 'BUY' ? m5SwingLevel - slBuffer : m5SwingLevel + slBuffer;
+        } else {
+          // Fallback to zone-based SL
+          sl = tradeSide === 'BUY' ? zone.low - (pipSize * 5) : zone.high + (pipSize * 5);
+        }
+        
+        // Validate SL distance
+        const slPips = Math.abs(entryPrice - sl) / pipSize;
+        if (slPips < 5 || slPips > config.maxSlPips) {
+          warn('ZONE_ENTRY', `${symbol} SL invalid (${slPips.toFixed(1)} pips) - skipping`, {});
+          continue;
+        }
+        
+        // Get structure TP
+        const m5StructureTP = await this.getM5StructureTP(symbol, tradeSide);
+        const slDistance = Math.abs(entryPrice - sl);
+        
+        // Calculate TP with 2RR minimum
+        let tp: number;
+        if (m5StructureTP) {
+          const structureDistance = Math.abs(m5StructureTP - entryPrice);
+          const structureRR = structureDistance / slDistance;
+          
+          if (structureRR >= 2) {
+            tp = m5StructureTP;
+          } else if (structureRR > 1) {
+            tp = tradeSide === 'BUY' 
+              ? entryPrice + (slDistance * 2.0) 
+              : entryPrice - (slDistance * 2.0);
+          } else {
+            warn('ZONE_ENTRY', `${symbol} structure TP only ${structureRR.toFixed(1)}RR - skipping`, {});
+            continue;
+          }
+        } else {
+          tp = tradeSide === 'BUY' 
+            ? entryPrice + (slDistance * 2.0) 
+            : entryPrice - (slDistance * 2.0);
+        }
+        
+        // Create setup
+        const setup: PendingSetup = {
+          symbol,
+          side: tradeSide,
+          sweepLevel: zone.midpoint,
+          sweepTime: new Date(),
+          sweepSession: 'london',
+          fvg: zone.type === 'fvg' ? zone.originalFVG! : null,
+          orderBlock: zone.type === 'order_block' ? zone.originalOB : undefined,
+          breakerZone: zone.type === 'breaker' ? zone.originalBreaker : undefined,
+          candlesSinceSweep: 0,
+          lastCandleTime: candles[candles.length - 1].time,
+          entryPrice,
+          sl,
+          tp,
+          status: 'waiting_entry',
+          setupType: zone.type === 'fvg' ? 'reversal' : zone.type === 'order_block' ? 'order_block' : 'breaker',
+          m5SwingLow: tradeSide === 'BUY' && m5SwingLevel ? m5SwingLevel : undefined,
+          m5SwingHigh: tradeSide === 'SELL' && m5SwingLevel ? m5SwingLevel : undefined,
+          m5StructureTP: m5StructureTP ?? undefined
+        };
+        
+        this.pendingSetups.set(symbol, setup);
+        await this.executeEntry(setup);
+        
+        // Mark zone as used
+        this.zoneManager.invalidateZone(symbol, zone.id);
+        
+        return true;
+      }
+    }
+    
+    // Check if all zones are broken (structure failure)
+    if (this.zoneManager.isStructureBroken(symbol, tradeSide)) {
+      info('STRUCTURE_BROKEN', `${symbol} all ${tradeSide} zones broken - structure failure`, {});
+      this.zoneManager.clearZones(symbol);
+      return false;
+    }
+    
+    return false;
+  }
+
+  /**
+   * Check for continuation pattern after sweep
    * TWO ways to detect continuation:
    * 1. Price makes new highs/lows beyond sweep (strong momentum)
    * 2. Price retests sweep level and bounces in sweep direction (retest continuation)
@@ -2610,34 +3640,6 @@ export class SweepFVGStrategy {
     }
     
     return false;
-  }
-
-  /**
-   * Calculate entry levels for continuation trade (retest of sweep level)
-   */
-  private calculateContinuationLevels(
-    setup: PendingSetup,
-    currentPrice: number,
-    isXAU: boolean,
-    pipSize: number
-  ): void {
-    const config = isXAU ? this.config.xau : this.config.fx;
-    
-    if (setup.side === 'BUY') {
-      // Continuation UP - enter on retest of sweep level (now support)
-      setup.entryPrice = setup.sweepLevel + (2 * pipSize); // Slightly above sweep level
-      setup.sl = setup.sweepLevel - (config.maxSlPips * pipSize);
-      const slDistance = setup.entryPrice - setup.sl;
-      setup.tp = setup.entryPrice + (slDistance * config.minRR);
-    } else {
-      // Continuation DOWN - enter on retest of sweep level (now resistance)
-      setup.entryPrice = setup.sweepLevel - (2 * pipSize); // Slightly below sweep level
-      setup.sl = setup.sweepLevel + (config.maxSlPips * pipSize);
-      const slDistance = setup.sl - setup.entryPrice;
-      setup.tp = setup.entryPrice - (slDistance * config.minRR);
-    }
-    
-    setup.status = 'waiting_entry';
   }
 
   private calculateLevels(setup: PendingSetup, isXAU: boolean, pipSize: number): void {
@@ -2960,12 +3962,22 @@ export class SweepFVGStrategy {
         });
         
         if (result && result.ticket) {
+          // Build entry reason for logging
+          const mode = this.getTradingMode(symbol);
+          const zoneType = setup.fvg ? 'FVG' : setup.orderBlock ? 'OB' : setup.breakerZone ? 'Breaker' : 'unknown';
+          const entryReason = setup.setupType.includes('double') || setup.setupType.includes('triple') 
+            ? setup.setupType.replace('_', ' ') 
+            : `${zoneType} in ${mode} mode`;
+          
           info('TRADE', `${symbol} ${side} MARKET order opened`, {
             ticket: result.ticket,
             entry: result.price,
             sl,
             tp,
-            volume
+            volume,
+            reason: entryReason,
+            setupType: setup.setupType,
+            mode
           });
           
           // Mark the sweep level as used so we don't re-enter same zone
@@ -2997,7 +4009,7 @@ export class SweepFVGStrategy {
             tp,
             volume,
             ticket: result.ticket
-          });
+          }, setup);
         }
       } else {
         // Place pending order (limit or stop)
@@ -3026,12 +4038,22 @@ export class SweepFVGStrategy {
         });
         
         if (result && result.order) {
+          // Build entry reason for logging
+          const mode = this.getTradingMode(symbol);
+          const zoneType = setup.fvg ? 'FVG' : setup.orderBlock ? 'OB' : setup.breakerZone ? 'Breaker' : 'unknown';
+          const entryReason = setup.setupType.includes('double') || setup.setupType.includes('triple') 
+            ? setup.setupType.replace('_', ' ') 
+            : `${zoneType} in ${mode} mode`;
+          
           info('TRADE', `${symbol} ${orderType} pending order placed`, {
             ticket: result.order,
             entry: entryPrice,
             sl,
             tp,
-            volume
+            volume,
+            reason: entryReason,
+            setupType: setup.setupType,
+            mode
           });
           
           // Save to persistent database FIRST (survives restarts)
@@ -3314,10 +4336,15 @@ export class SweepFVGStrategy {
       const payload = setup ? {
         status: setup.status === 'waiting_fvg' ? 'sweep_detected' : 
                 setup.status === 'waiting_entry' ? 'fvg_formed' : 
-                setup.status === 'continuation' ? 'continuation' :
-                setup.status === 'trend_entry' ? 'trend_entry' :
+                setup.status === 'waiting_rejection' ? 'fvg_formed' :
+                setup.status === 'waiting_continuation_retest' ? 'waiting_retest' :
+                setup.status === 'waiting_trend_retest' ? 'waiting_retest' :
                 setup.status === 'pending_order' ? 'pending_order' :
-                setup.status === 'ready' ? 'waiting_entry' : 'scanning',
+                setup.status === 'waiting_ob' ? 'waiting_ob' :
+                setup.status === 'waiting_breaker_retest' ? 'waiting_breaker_retest' :
+                setup.status === 'ready' ? 'waiting_entry' : 
+                setup.setupType === 'order_block' ? 'order_block' :
+                setup.setupType === 'breaker' ? 'breaker' : 'scanning',
         symbol,
         side: setup.side,
         currentPrice: currentPrice || 0,
@@ -3325,6 +4352,13 @@ export class SweepFVGStrategy {
         fvgHigh: setup.fvg?.high,
         fvgLow: setup.fvg?.low,
         fvgSide: setup.fvg?.side,
+        // Order Block info
+        obHigh: setup.orderBlock?.high,
+        obLow: setup.orderBlock?.low,
+        obStrength: setup.orderBlock?.strength,
+        // Breaker zone info
+        breakerLevel: setup.breakerZone?.level,
+        breakerSide: setup.breakerZone?.side,
         entryPrice: setup.entryPrice,
         sl: setup.sl,
         tp: setup.tp,
@@ -3359,8 +4393,37 @@ export class SweepFVGStrategy {
     }
   }
 
-  private async sendTradeToAPI(trade: TradeResult): Promise<void> {
+  private async sendTradeToAPI(trade: TradeResult, setup?: PendingSetup): Promise<void> {
     try {
+      // Build entry reason string
+      let entryReason = 'Unknown';
+      let zoneType = 'unknown';
+      let zonePrice = 0;
+      
+      if (setup) {
+        const mode = this.getTradingMode(trade.symbol);
+        zoneType = setup.fvg ? 'fvg' : setup.orderBlock ? 'order_block' : setup.breakerZone ? 'breaker' : 'unknown';
+        
+        if (setup.fvg) {
+          zonePrice = (setup.fvg.high + setup.fvg.low) / 2;
+          entryReason = mode === 'sweep' ? 'FVG after sweep' : 'FVG in trend mode';
+        } else if (setup.orderBlock) {
+          zonePrice = (setup.orderBlock.bodyHigh + setup.orderBlock.bodyLow) / 2;
+          entryReason = mode === 'sweep' ? 'Order Block after sweep' : 'Order Block in trend mode';
+        } else if (setup.breakerZone) {
+          zonePrice = setup.breakerZone.level;
+          entryReason = mode === 'sweep' ? 'Breaker retest after sweep' : 'Breaker retest in trend mode';
+        } else if (setup.setupType.includes('double') || setup.setupType.includes('triple')) {
+          entryReason = `${setup.setupType.replace('_', ' ')} pattern`;
+        } else if (setup.setupType === 'continuation') {
+          entryReason = 'Continuation after failed reversal';
+        } else if (setup.setupType === 'trend') {
+          entryReason = 'Trend mode entry';
+        }
+      }
+      
+      const mode = this.getTradingMode(trade.symbol);
+      
       const response = await fetch('http://localhost:3001/api/trades', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -3374,7 +4437,14 @@ export class SweepFVGStrategy {
           ticket: trade.ticket,
           openTime: new Date().toISOString(),
           status: 'open',
-          strategy: 'SweepFVG'
+          strategy: 'SweepFVG',
+          // Enhanced fields
+          setupType: setup?.setupType || 'unknown',
+          tradingMode: mode,
+          entryReason,
+          zoneType,
+          zonePrice,
+          patternType: setup?.reversalPattern?.type || null
         })
       });
     } catch (err) {

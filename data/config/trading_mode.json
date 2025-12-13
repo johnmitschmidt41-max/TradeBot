@@ -4,7 +4,7 @@
   "consecutiveLosses": 0,
   "autoSwitchLocked": false,
   "lockExpiresAt": null,
-  "riskFX": 3,
-  "riskXAU": 3,
+  "riskFX": 2,
+  "riskXAU": 1,
   "riskIndices": 3
 }
